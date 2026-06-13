@@ -1,0 +1,200 @@
+"""dBase-III variant parser for ``QD1``–``QD4`` substreams.
+
+Layout (after decoding by :mod:`pyqld.codec`)::
+
+    file header (32 bytes):
+        u32  magic = 0x0B047E03
+        u32  nrecs
+        u32  unknown (often 0)
+        20   reserved zeros
+
+    field records (32 bytes each, repeated):
+        char[11]   name        (null-padded ASCII)
+        char       type        ('C' char, 'N' numeric, 'L' logical)
+        u8[4]      reserved
+        u8         width
+        u8         decimals    (for type 'N')
+        u8[14]     padding
+
+    terminator:
+        u8 = 0x0D                 (classic dBase-III header sentinel)
+
+    records (nrecs × (1 + sum(widths)) bytes):
+        u8         deletion flag (0x00 = live, 0x2A = '*' = deleted)
+        ASCII field values, space- or zero-padded to each field's width
+
+    trailer:
+        u8[2]      file-end marker (typically 0x1A 0x00, ignored)
+
+Numeric fields are stored as right-aligned ASCII digits.
+Logical fields hold ``'T'``/``'F'`` (or ``'1'``/``'0'``).
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass, field
+from typing import Any
+
+#: Two-byte magic prefix that distinguishes dBase from INI substreams.
+MAGIC_PREFIX: bytes = b"\x03\x7e"
+
+_FIELD_TYPES: frozenset[str] = frozenset("CNL")
+_HEADER_TERMINATOR: int = 0x0D
+
+
+def is_dbf(data: bytes) -> bool:
+    """Return ``True`` if ``data`` looks like a TargetLynx dBase table.
+
+    Checks the first two bytes against :data:`MAGIC_PREFIX`.
+    """
+    return len(data) >= 4 and data[:2] == MAGIC_PREFIX
+
+
+@dataclass(frozen=True)
+class DBFField:
+    """Metadata for one column in a dBase table."""
+
+    name: str
+    type: str  # 'C', 'N', or 'L'
+    width: int
+    decimals: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "type": self.type,
+            "width": self.width,
+            "decimals": self.decimals,
+        }
+
+
+@dataclass
+class DBFTable:
+    """A parsed dBase table with fields and records."""
+
+    nrecs: int
+    fields: list[DBFField]
+    records: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": "dbf",
+            "nrecs": self.nrecs,
+            "fields": [f.to_dict() for f in self.fields],
+            "records": self.records,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Value decoding
+# ---------------------------------------------------------------------------
+
+
+def _decode_value(raw: bytes, ftype: str, decimals: int) -> Any:
+    """Decode a single field value from raw bytes."""
+    s = raw.decode("ascii", "replace").strip(" \x00")
+
+    if ftype == "N":
+        if not s:
+            return None
+        try:
+            return float(s) if decimals else int(s)
+        except ValueError:
+            try:
+                return float(s)
+            except ValueError:
+                return s
+
+    if ftype == "L":
+        return s.upper() in ("T", "Y", "1")
+
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
+def parse_dbf(data: bytes) -> DBFTable:
+    """Parse a TargetLynx dBase-III variant table from ``data``.
+
+    Parameters
+    ----------
+    data : bytes
+        The decoded (plaintext) stream bytes.
+
+    Returns
+    -------
+    DBFTable
+        Parsed table with fields and records.
+
+    Raises
+    ------
+    ValueError
+        If the data does not start with the dBase magic prefix.
+    """
+    if not is_dbf(data):
+        raise ValueError(f"not a dBase table: magic={data[:4].hex()}")
+
+    nrecs = struct.unpack_from("<I", data, 4)[0]
+
+    # Use authoritative header values for record offset and size.
+    header_len = struct.unpack_from("<H", data, 8)[0]
+    rec_size_hdr = struct.unpack_from("<H", data, 10)[0]
+
+    # Parse field descriptors
+    fields: list[DBFField] = []
+    off = 32
+    n = len(data)
+
+    while off + 32 <= n:
+        chunk = data[off : off + 32]
+        if chunk[0] in (0x00, _HEADER_TERMINATOR):
+            break
+        ftype = chr(chunk[11])
+        if ftype not in _FIELD_TYPES:
+            break
+        name = chunk[:11].split(b"\x00", 1)[0].decode("ascii", "replace")
+        width = chunk[16]
+        decimals = chunk[17]
+        fields.append(
+            DBFField(name=name, type=ftype, width=width, decimals=decimals)
+        )
+        off += 32
+
+    sum_widths = sum(f.width for f in fields)
+
+    # Determine record offset
+    if header_len and 0 < header_len <= n:
+        rec_off = header_len
+    else:
+        if off < n and data[off] == _HEADER_TERMINATOR:
+            off += 1
+        rec_off = off
+
+    rec_size = rec_size_hdr if rec_size_hdr >= sum_widths else 1 + sum_widths
+
+    # Parse records
+    records: list[dict[str, Any]] = []
+    for i in range(nrecs):
+        start = rec_off + i * rec_size
+        end = start + rec_size
+        if end > n:
+            break
+        rec = data[start:end]
+        deletion_flag = rec[0]
+
+        pos = 1
+        out: dict[str, Any] = {}
+        if deletion_flag == 0x2A:  # '*'
+            out["__deleted__"] = True
+
+        for f in fields:
+            raw = rec[pos : pos + f.width]
+            pos += f.width
+            out[f.name] = _decode_value(raw, f.type, f.decimals)
+        records.append(out)
+
+    return DBFTable(nrecs=nrecs, fields=fields, records=records)
