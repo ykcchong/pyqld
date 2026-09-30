@@ -8,35 +8,52 @@ The `.qld` file is a proprietary binary container used by Waters TargetLynx to s
 
 `pyqld` fully decodes these files and exposes the data through:
 
-* A **high-level object model** (`Dataset`, `Sample`, `Compound`, `Peak`, `Chromatogram`, `Spectrum`) with attribute access
+* A **high-level object model** with snake_case mappings, typed result quality,
+  integration, acquisition, calibration, and audit values
 * A **JSON exporter** (single file or directory tree)
 * A **CLI** for quick inspection and export
 
 ## Installation
 
-Clone the project. Then `pip install .`
+From a checkout of this repository:
+
+```bash
+python -m pip install ./pyqld
+```
+
+To build a wheel for direct distribution:
+
+```bash
+cd pyqld
+python -m pip wheel . --no-deps --wheel-dir dist
+```
 
 Requires Python 3.10+ and the `olefile` package (installed automatically).
 
 ## Quick start
 
 ```python
-from pyqld import Dataset
+import pyqld
 
-ds = Dataset.from_path("datafile.qld")
+ds = pyqld.read("datafile.qld")
 print(ds)  # <Dataset samples=13 compounds=146 peaks=...>
 
 # Lookup by name or index
 sample = ds.sample("sample")
 compound = ds.compound("compound")
 
-# Get a (sample, compound) pair
-pair = ds.pair(sample, compound)
+# Get a (sample, compound) result
+pair = ds[sample, compound]
 print(pair.area, pair.height, pair.retention_time)
+print(pair.result.integration, pair.result.quality)
+
+# Filter even unnamed QD2 rows by transition
+rows = ds.results_for(sample, transition=compound.quantifier_transition)
 
 # Access chromatogram data
-for ch in pair.chromatograms:
-    print(ch.trace, len(ch.times), len(ch.intensities))
+for chromatogram in pair.chromatograms:
+    for time, intensity in chromatogram:
+        pass
 
 # Access spectra
 for sp in pair.spectra(rt_window=0.2):
@@ -46,10 +63,35 @@ for sp in pair.spectra(rt_window=0.2):
 n_detected = sum(1 for p in ds.pairs() if p.area and p.area > 0)
 ```
 
+The entire file is decoded eagerly. The returned object does not hold an open
+file handle and does not require a context manager.
+
+## Edit A Copy
+
+```python
+edited = ds.with_changes(ds.samples[0], file_text="Reviewed sample")
+edited.save("reviewed.qld")
+```
+
+Existing sample, compound, method, and result fields can be edited with width
+and type validation. Relationship fields are protected. Saving preserves
+unmodified streams and refuses existing destinations by default. This does not
+recalculate quantitation or add vendor audit records; native TargetLynx
+compatibility is not yet verified. See [editing details](docs/usage.md#edit-and-save-qld).
+
+## Command line
+
+```bash
+pyqld datafile.qld --list
+pyqld datafile.qld datafile.json --indent 2
+pyqld datafile.qld --out-dir exported --split-sections --indent 2
+```
+
 ## API reference
 
 ### High-level I/O
 
+* **`read(path)`** — preferred API; return a navigable `Dataset`
 * **`open_qld(path)`** — read a `.qld` file into a `QLDFile`
 * **`to_json(qld, indent=None)`** — serialize to JSON string
 * **`export_json(qld_path, json_path)`** — write JSON to disk
@@ -60,17 +102,19 @@ n_detected = sum(1 for p in ds.pairs() if p.area and p.area > 0)
 * **`Dataset.from_path(path)`** — high-level wrapper with attribute access
 * **`Dataset.sample(key)`** — lookup by index, ID, or file name
 * **`Dataset.compound(key)`** — lookup by index or name
-* **`Dataset.pair(sample, compound)`** — get a `SampleCompound` join view
+* **`dataset[sample, compound]`** — get a `CompoundResult` view
+* **`Dataset.results_for(...)`** — filter named or unnamed quantitation results
 * **`Dataset.pairs()`** — iterate all (sample, compound) pairs
-* **`Dataset.method`** — analytical method view (method compounds + audit)
+* **`Dataset.acquisition(sample)`** — parsed acquisition metadata
+* **`Dataset.method`** — calibrations, method compounds, and audit events
 
-### `SampleCompound`
+### `CompoundResult`
 
-* **`.peaks`** — list of `Peak` for this pair
-* **`.primary_peak`** — peak with `METH_PEAK == 0`
+* **`.results`** — list of `QuantitationResult` objects for this pair
+* **`.result`** — primary quantitation result
 * **`.area`**, **`.height`**, **`.retention_time`** — from primary peak
 * **`.chromatograms`** — list of `Chromatogram` (quan, then qual)
-* **`.quan_chromatogram`**, **`.qual_chromatogram`**
+* **`.quantifier_chromatogram`**, **`.qualifier_chromatogram`**
 * **`.spectra(rt_window=None)`** — matching spectra, optionally filtered by RT
 
 ### Low-level parsers
@@ -92,11 +136,22 @@ A `.qld` file is an OLE2 Compound Document containing:
 | `QD5` | chromatograms | `[Chromatogram]` trace sections (INI) |
 | `QD6` | sample_info | `[SampleInfo]` + acquisition headers (INI) |
 | `QD7` | spectra | `[Spectrum]` mass+intensity sections (INI) |
+| `QD8` | qd8 | Reserved/unknown INI stream; retained when present |
 | `qld` | audit | `[Header]` audit-trail sections (INI) |
 
 Each substream is **LZSS-compressed** then **XOR-encrypted** with key `0x65`.
 
-See [docs/format.md](docs/format.md) for the full format specification.
+## Documentation
+
+* [User guide](docs/usage.md) — installation, lookup, chromatograms, spectra, export, and errors
+* [API reference](docs/api.md) — public classes, methods, and return values
+* [File format](docs/format.md) — OLE streams, LZSS/XOR codec, dBase, and INI layouts
+* [Development guide](docs/development.md) — architecture, module ownership, tests, and releases
+* [Codebase review](docs/review.md) — consolidation decision, verified fixture, and remaining risks
+
+The supported implementation is this package. The repository's
+`targetlynx_parser`, `qld_parser`, and `old` directories are historical
+reverse-engineering work and are not runtime dependencies.
 
 ## Development
 

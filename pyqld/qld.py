@@ -8,10 +8,13 @@ table or an INI-style nested section document.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import re
+import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +31,7 @@ STREAM_LABELS: dict[str, str] = {
     "QD5": "chromatograms",
     "QD6": "sample_info",
     "QD7": "spectra",
+    "QD8": "qd8",
     "qld": "audit",
 }
 
@@ -51,6 +55,69 @@ class QLDFile:
     path: str
     streams: dict[str, bytes] = field(default_factory=dict)
     tables: dict[str, Any] = field(default_factory=dict)
+    _source: bytes | None = field(default=None, repr=False, compare=False)
+    _modified: frozenset[str] = field(default_factory=frozenset, repr=False)
+
+    def with_changes(self, table: str, index: int, **values: Any) -> QLDFile:
+        """Return an edited copy of one QD1-QD4 row using field names."""
+        return self.with_rows(table, {index: values})
+
+    def with_rows(self, table: str, changes: dict[int, dict[str, Any]]) -> QLDFile:
+        """Return an atomic edited copy of several rows in one table."""
+        from .writer import edit_table_rows
+
+        if table not in {"QD1", "QD2", "QD3", "QD4"}:
+            raise ValueError("only existing QD1-QD4 table fields can be edited")
+        if self._source is None:
+            raise ValueError("editing requires a file loaded with open_qld() or read()")
+        if not isinstance(self.tables.get(table), DBFTable):
+            raise ValueError(f"{table} is not an available DBF table")
+        payload = edit_table_rows(self.streams[table], changes)
+        return replace(
+            self,
+            streams={**self.streams, table: payload},
+            tables={**self.tables, table: parse_dbf(payload)},
+            _modified=self._modified | {table},
+        )
+
+    def to_bytes(self) -> bytes:
+        """Serialize an edited copy; preserve the original bytes for a no-op save."""
+        import olefile
+
+        from .writer import encode_quan_stream, replace_streams
+
+        if self._source is None:
+            raise ValueError("saving requires an original QLD container")
+        if not self._modified:
+            return self._source
+        replacements = {}
+        with olefile.OleFileIO(io.BytesIO(self._source)) as ole:
+            for path in ole.listdir():
+                name = "/".join(path)
+                match = _QD_STREAM_RE.search(name)
+                if match and match.group(1) in self._modified:
+                    replacements[name] = encode_quan_stream(self.streams[match.group(1)])
+        return replace_streams(self._source, replacements)
+
+    def save(self, path: str | Path, *, overwrite: bool = False) -> Path:
+        """Atomically save a QLD copy, refusing existing targets by default."""
+        destination = Path(path)
+        payload = self.to_bytes()
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if overwrite:
+                os.replace(temporary, destination)
+            else:
+                os.link(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return destination
 
     def stream_names(self) -> list[str]:
         """Return the list of decoded stream basenames."""
@@ -78,11 +145,7 @@ class QLDFile:
             entry: dict[str, Any] = {"label": label}
             if isinstance(parsed, DBFTable):
                 entry.update(parsed.to_dict())
-            elif (
-                isinstance(parsed, list)
-                and parsed
-                and isinstance(parsed[0], IniSection)
-            ):
+            elif isinstance(parsed, list):
                 entry["kind"] = "ini"
                 entry["sections"] = [
                     {"name": s.name, "body": s.to_dict()} for s in parsed
@@ -104,7 +167,7 @@ class QLDFile:
 # ---------------------------------------------------------------------------
 
 
-def _iter_ole_streams(ole_path: Path) -> Iterable[tuple[str, bytes]]:
+def _iter_ole_streams(ole_path: Path | bytes) -> Iterable[tuple[str, bytes]]:
     """Yield ``(basename, raw_bytes)`` for each TargetLynx data sub-stream."""
     try:
         import olefile
@@ -113,7 +176,8 @@ def _iter_ole_streams(ole_path: Path) -> Iterable[tuple[str, bytes]]:
             "pyqld requires the 'olefile' package (pip install olefile)"
         ) from e
 
-    with olefile.OleFileIO(str(ole_path)) as ole:
+    source = io.BytesIO(ole_path) if isinstance(ole_path, bytes) else str(ole_path)
+    with olefile.OleFileIO(source) as ole:
         for entry in ole.listdir(streams=True, storages=False):
             joined = "/".join(entry)
             m = _QD_STREAM_RE.search(joined)
@@ -144,9 +208,10 @@ def open_qld(path: str | Path) -> QLDFile:
     * Otherwise it is parsed by :func:`pyqld.ini.parse_ini`.
     """
     p = Path(path)
-    qld = QLDFile(path=str(p.resolve()))
+    source_bytes = p.read_bytes()
+    qld = QLDFile(path=str(p.resolve()), _source=source_bytes)
 
-    for name, raw in _iter_ole_streams(p):
+    for name, raw in _iter_ole_streams(source_bytes):
         plaintext = decode_quan_stream(raw)
         qld.streams[name] = plaintext
         if is_dbf(plaintext):
@@ -219,7 +284,7 @@ def _ini_stream_dict(
 def _write_json(path: Path, obj: Any, indent: int | None) -> int:
     text = json.dumps(obj, indent=indent, ensure_ascii=False, default=str)
     path.write_text(text, encoding="utf-8")
-    return len(text)
+    return path.stat().st_size
 
 
 def export_dir(
@@ -278,7 +343,7 @@ def export_dir(
 
         elif isinstance(parsed, list):  # list[IniSection]
             n_sections = len(parsed)
-            if split_sections and n_sections > split_threshold:
+            if split_sections and n_sections >= split_threshold:
                 sub = out / label
                 sub.mkdir(exist_ok=True)
                 singular = (
@@ -346,5 +411,5 @@ def export_dir(
 
         manifest["streams"][stream] = entry
 
-    _write_json(out / "manifest.json", manifest, indent or 2)
+    _write_json(out / "manifest.json", manifest, indent)
     return out

@@ -137,8 +137,40 @@ class TestParseDbf:
         assert len(d["fields"]) == 1
         assert d["fields"][0]["name"] == "A"
 
+    def test_duplicate_field_names_are_preserved(self) -> None:
+        data = _build_dbf(
+            fields=[("VALUE", "N", 3, 0), ("VALUE", "N", 3, 0)],
+            records=[["1", "2"]],
+        )
+
+        table = parse_dbf(data)
+
+        assert [field.key for field in table.fields] == ["VALUE", "VALUE_2"]
+        assert table.records[0] == {"VALUE": 1, "VALUE_2": 2}
+
 
 class TestToDict:
+    def test_encode_edits(self) -> None:
+        from pyqld.dbf import DBFField
+
+        assert DBFField("TEXT", "C", 6, 0).encode("edit") == b"edit  "
+        assert DBFField("AREA", "N", 8, 2).encode(12.345) == b"  12.345"
+        assert DBFField("AREA", "N", 8, 2).encode(None) == b"        "
+        assert DBFField("FLAG", "L", 1, 0).encode(False) == b"F"
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), "bad", True])
+    def test_reject_invalid_number(self, value) -> None:
+        from pyqld.dbf import DBFField
+
+        with pytest.raises(ValueError):
+            DBFField("AREA", "N", 8, 2).encode(value)
+
+    def test_reject_truncation(self) -> None:
+        from pyqld.dbf import DBFField
+
+        with pytest.raises(ValueError, match="width"):
+            DBFField("TEXT", "C", 3, 0).encode("long")
+
     def test_field_to_dict(self) -> None:
         from pyqld.dbf import DBFField
 
@@ -146,6 +178,7 @@ class TestToDict:
         d = f.to_dict()
         assert d == {
             "name": "TEST",
+            "key": "TEST",
             "type": "C",
             "width": 10,
             "decimals": 0,

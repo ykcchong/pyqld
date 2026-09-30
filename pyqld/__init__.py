@@ -8,9 +8,9 @@ Quick start
 
 .. code-block:: python
 
-    from pyqld import Dataset
+    import pyqld
 
-    ds = Dataset.from_path("UMP 20260508 PS.qld")
+    ds = pyqld.read("UMP 20260508 PS.qld")
     print(ds)  # <Dataset samples=13 compounds=146 peaks=...>
 
     pair = ds.pair("UMP B", "5-HIAA")
@@ -24,6 +24,7 @@ Public API
 
 High-level
 ~~~~~~~~~~
+* :func:`read`              — read a ``.qld`` file into a navigable dataset.
 * :func:`open_qld`          — read a ``.qld`` file into a :class:`QLDFile`.
 * :class:`QLDFile`          — in-memory representation of one ``.qld``.
 * :func:`to_json`           — serialize a :class:`QLDFile` to JSON.
@@ -35,12 +36,14 @@ Object model
 * :class:`Dataset`          — high-level wrapper with attribute access.
 * :class:`Sample`           — one row of the samples table (``QD1``).
 * :class:`Compound`         — one row of the compounds table (``QD3``).
-* :class:`Peak`             — one row of the peaks table (``QD2``).
+* :class:`QuantitationResult` — one row of the results table (``QD2``).
 * :class:`Chromatogram`     — one ``[Chromatogram]`` section from ``QD5``.
 * :class:`Spectrum`         — one ``[Spectrum]`` section from ``QD7``.
-* :class:`SampleCompound`   — join view for a ``(sample, compound)`` pair.
+* :class:`CompoundResult`   — join view for a ``(sample, compound)`` pair.
 * :class:`MethodCompound`   — one row of the method-compounds table (``QD4``).
 * :class:`Method`           — analytical method view.
+
+``Peak`` and ``SampleCompound`` remain compatibility aliases.
 
 Mid-level parsers
 ~~~~~~~~~~~~~~~~~
@@ -60,21 +63,41 @@ Low-level codec
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .codec import XOR_KEY, decode_quan_stream, decrypt, lzss_decode
 from .dbf import DBFTable, parse_dbf
+from .domain import (
+    AcquisitionInfo,
+    AcquisitionReport,
+    AuditEvent,
+    CalibrationCurve,
+    CalibrationPoint,
+    Integration,
+    Quality,
+)
 from .ini import IniBlob, IniSection, parse_ini
 from .model import (
     Chromatogram,
     Compound,
+    CompoundResult,
     Dataset,
     Method,
     MethodCompound,
     Peak,
+    QuantitationResult,
     Sample,
     SampleCompound,
     Spectrum,
 )
 from .qld import QLDFile, export_dir, export_json, open_qld, to_json
+from .quantitation import LinearCalibration, PeakIntegration, integrate_peak
+
+
+def read(path: str | Path) -> Dataset:
+    """Read a TargetLynx ``.qld`` file into a navigable dataset."""
+    return Dataset.from_path(path)
+
 
 __all__ = [
     # Version
@@ -84,12 +107,25 @@ __all__ = [
     "Sample",
     "Compound",
     "MethodCompound",
+    "QuantitationResult",
     "Peak",
     "Chromatogram",
     "Spectrum",
     "SampleCompound",
+    "CompoundResult",
     "Method",
+    "Integration",
+    "Quality",
+    "CalibrationPoint",
+    "CalibrationCurve",
+    "AcquisitionReport",
+    "AcquisitionInfo",
+    "AuditEvent",
+    "LinearCalibration",
+    "PeakIntegration",
+    "integrate_peak",
     # High-level I/O
+    "read",
     "QLDFile",
     "open_qld",
     "to_json",
@@ -108,4 +144,4 @@ __all__ = [
     "decrypt",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

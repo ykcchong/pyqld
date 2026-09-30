@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from pyqld import Dataset
+import pyqld
 
 
 def main() -> None:
@@ -23,8 +23,7 @@ def main() -> None:
         print(f"File not found: {qld_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Load the dataset
-    ds = Dataset.from_path(qld_path)
+    ds = pyqld.read(qld_path)
     print(f"Dataset: {ds}")
     print()
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 #: Two-byte magic prefix that distinguishes dBase from INI substreams.
@@ -59,14 +60,49 @@ class DBFField:
     type: str  # 'C', 'N', or 'L'
     width: int
     decimals: int
+    occurrence: int = 1
+
+    @property
+    def key(self) -> str:
+        """Unique record key, with a suffix for repeated vendor names."""
+        return self.name if self.occurrence == 1 else f"{self.name}_{self.occurrence}"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "key": self.key,
             "type": self.type,
             "width": self.width,
             "decimals": self.decimals,
         }
+
+    def encode(self, value: Any) -> bytes:
+        """Encode an edited value without truncation or numeric rounding."""
+        if self.type == "L":
+            if not isinstance(value, bool):
+                raise ValueError(f"{self.key} requires a boolean")
+            text = "T" if value else "F"
+        elif self.type == "N":
+            if value is None or value == "":
+                text = ""
+            else:
+                try:
+                    number = Decimal(str(value))
+                except InvalidOperation as error:
+                    raise ValueError(f"{self.key} requires a number") from error
+                if not number.is_finite():
+                    raise ValueError(f"{self.key} requires a finite number")
+                text = format(number, "f")
+        else:
+            if not isinstance(value, str):
+                raise ValueError(f"{self.key} requires text")
+            if any(ord(character) < 32 or ord(character) > 126 for character in value):
+                raise ValueError(f"{self.key} requires printable ASCII text")
+            text = value
+        encoded = text.encode("ascii")
+        if len(encoded) > self.width:
+            raise ValueError(f"{self.key} exceeds its {self.width}-byte field width")
+        return encoded.rjust(self.width) if self.type == "N" else encoded.ljust(self.width)
 
 
 @dataclass
@@ -146,6 +182,7 @@ def parse_dbf(data: bytes) -> DBFTable:
 
     # Parse field descriptors
     fields: list[DBFField] = []
+    field_occurrences: dict[str, int] = {}
     off = 32
     n = len(data)
 
@@ -157,10 +194,18 @@ def parse_dbf(data: bytes) -> DBFTable:
         if ftype not in _FIELD_TYPES:
             break
         name = chunk[:11].split(b"\x00", 1)[0].decode("ascii", "replace")
+        occurrence = field_occurrences.get(name, 0) + 1
+        field_occurrences[name] = occurrence
         width = chunk[16]
         decimals = chunk[17]
         fields.append(
-            DBFField(name=name, type=ftype, width=width, decimals=decimals)
+            DBFField(
+                name=name,
+                type=ftype,
+                width=width,
+                decimals=decimals,
+                occurrence=occurrence,
+            )
         )
         off += 32
 
@@ -194,7 +239,7 @@ def parse_dbf(data: bytes) -> DBFTable:
         for f in fields:
             raw = rec[pos : pos + f.width]
             pos += f.width
-            out[f.name] = _decode_value(raw, f.type, f.decimals)
+            out[f.key] = _decode_value(raw, f.type, f.decimals)
         records.append(out)
 
     return DBFTable(nrecs=nrecs, fields=fields, records=records)

@@ -25,6 +25,7 @@ The `.qld` file is a proprietary binary container used by Waters TargetLynx to s
 | `QuanData/DataStream.QD5` | chromatograms | `[Chromatogram]` sections (INI) |
 | `QuanData/DataStream.QD6` | sample_info | `[SampleInfo]` sections (INI) |
 | `QuanData/DataStream.QD7` | spectra | `[Spectrum]` sections (INI) |
+| `QuanData/DataStream.QD8` | qd8 | Reserved/unknown sections; currently empty |
 | `QuanData/DataStream.qld` | audit | `[Header]` audit trail (INI) |
 
 ## Substream Codec
@@ -70,10 +71,11 @@ After LZSS decompression, every byte is XOR-ed with `0x65` (ASCII `'e'`).
 
 ```
 file header (32 bytes):
-    u32  magic = 0x0B047E03
-    u32  nrecs
-    u32  unknown
-    20   reserved zeros
+    u8[4] magic/version (starts 03 7E)
+    u32   nrecs
+    u16   header length (record-data offset)
+    u16   record size
+    u8[20] reserved
 
 field records (32 bytes each):
     char[11]   name (null-padded ASCII)
@@ -85,12 +87,12 @@ field records (32 bytes each):
 
 terminator: u8 = 0x0D
 
-records (nrecs × (1 + sum(widths)) bytes):
+records (nrecs × record_size bytes):
     u8         deletion flag (0x00 = live, 0x2A = deleted)
     ASCII field values, padded to each field's width
 ```
 
-### INI-Style Sections (QD5–QD7, qld)
+### INI-Style Sections (QD5–QD8, qld)
 
 ```
 file        := section*
@@ -101,3 +103,7 @@ blob        := <u32 marker=1> <u32 size> <size bytes payload> LE
 ```
 
 Blobs contain either packed `float32` arrays (for `Times`, `Masses`, `Intensities`, etc.) or ASCII text.
+
+Unknown blob payloads are retained as bytes and represented as base64 by the
+JSON serializer. QD8 is observed as empty in current fixtures, but readers must
+not assume it is absent.

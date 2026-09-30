@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyqld"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read Waters TargetLynx .qld quantitation files on any platform"
 readme = "README.md"
 license = "MIT"
@@ -35,6 +35,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "olefile>=0.47",
+    "numpy>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +61,9 @@ pyqld = "pyqld.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pyqld*"]
+
+[tool.setuptools.package-data]
+pyqld = ["py.typed"]
 
 [tool.ruff]
 target-version = "py310"
