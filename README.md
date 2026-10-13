@@ -30,6 +30,14 @@ python -m pip wheel . --no-deps --wheel-dir dist
 
 Requires Python 3.10+ and the `olefile` package (installed automatically).
 
+Installation also attempts to build small C extensions that accelerate LZSS
+decoding (combined with XOR decryption) and DBF cell conversion. Source builds
+need a C compiler and Python development headers for acceleration. If compilation
+is unavailable, the package automatically uses the Python implementations.
+Compiled wheels are specific to the target Python version and platform.
+See [codec performance](docs/codec-performance.md)
+for the implementation tradeoffs and a reproducible benchmark.
+
 ## Quick start
 
 ```python

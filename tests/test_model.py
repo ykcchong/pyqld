@@ -90,6 +90,23 @@ def test_records_are_snake_case_mappings() -> None:
     assert sample.raw_fields["INJ_VOL"] == "10.0"
 
 
+def test_record_aliases_are_shared_immutable_and_schema_sensitive() -> None:
+    from pyqld.model import Sample
+
+    first = Sample({"A-B": 1, "A B": 2}, 0)
+    second = Sample({"A-B": 3, "A B": 4}, 1)
+    reversed_keys = Sample({"A B": 5, "A-B": 6}, 2)
+    deleted = Sample({"__deleted__": True, "A-B": 7, "A B": 8}, 3)
+    assert first._keys is second._keys
+    assert first["a_b"] == 2
+    assert second["a_b"] == 4
+    assert reversed_keys["a_b"] == 6
+    assert deleted["deleted"] is True
+    assert list(first) == ["a_b"]
+    with pytest.raises(TypeError):
+        first._keys["new"] = "A-B"
+
+
 def test_spectra_are_scoped_to_their_sample() -> None:
     spectra = []
     for function, time in (("3", "1.0"), ("4", "2.0"), ("3", "3.0")):

@@ -100,3 +100,16 @@ def test_audit_event_converts_filetime() -> None:
     assert event.event == "Process Calibrate"
     assert event.sample_index is None
     assert event.peak_index == 42
+
+
+def test_report_header_guard_preserves_sections_and_duplicate_values() -> None:
+    from pyqld import AcquisitionReport
+
+    report = AcquisitionReport(
+        "ordinary line\nGeneral: first\n  -- Header --  \n"
+        "SampleID: A\nSampleID: B\nSampleID: C\n"
+        "--not a header: still a value\n -- End Header -- \nGeneral: last\n"
+    )
+    assert report['header']['sample_id'] == ('A', 'B', 'C')
+    assert report['header']['not_a_header'] == 'still a value'
+    assert report['general']['general'] == ('first', 'last')

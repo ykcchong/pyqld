@@ -37,6 +37,11 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+try:
+    from ._dbf_native import parse_records as _native_parse_records
+except ImportError:
+    _native_parse_records = None
+
 #: Two-byte magic prefix that distinguishes dBase from INI substreams.
 MAGIC_PREFIX: bytes = b"\x03\x7e"
 
@@ -129,7 +134,12 @@ class DBFTable:
 
 def _decode_value(raw: bytes, ftype: str, decimals: int) -> Any:
     """Decode a single field value from raw bytes."""
-    s = raw.decode("ascii", "replace").strip(" \x00")
+    return _decode_text_value(raw.decode("ascii", "replace"), ftype, decimals)
+
+
+def _decode_text_value(text: str, ftype: str, decimals: int) -> Any:
+    """Decode a field from an already decoded record."""
+    s = text.strip(" \x00")
 
     if ftype == "N":
         if not s:
@@ -221,6 +231,18 @@ def parse_dbf(data: bytes) -> DBFTable:
 
     rec_size = rec_size_hdr if rec_size_hdr >= sum_widths else 1 + sum_widths
 
+    # Resolve duplicate-name keys and field boundaries once per table.
+    layout = []
+    pos = 1
+    for f in fields:
+        layout.append((f.key, pos, pos + f.width, f.type, f.decimals))
+        pos += f.width
+
+    if _native_parse_records is not None and isinstance(data, bytes) and rec_size > 0:
+        count = min(nrecs, (n - rec_off) // rec_size)
+        records = _native_parse_records(data, rec_off, rec_size, count, layout)
+        return DBFTable(nrecs=nrecs, fields=fields, records=records)
+
     # Parse records
     records: list[dict[str, Any]] = []
     for i in range(nrecs):
@@ -228,18 +250,17 @@ def parse_dbf(data: bytes) -> DBFTable:
         end = start + rec_size
         if end > n:
             break
-        rec = data[start:end]
+        # ASCII replacement maps each byte to one character, preserving field
+        # offsets even for corrupt/non-ASCII bytes. Avoid decoding every cell.
+        rec = data[start:end].decode("ascii", "replace")
         deletion_flag = rec[0]
 
-        pos = 1
         out: dict[str, Any] = {}
-        if deletion_flag == 0x2A:  # '*'
+        if deletion_flag == "*":
             out["__deleted__"] = True
 
-        for f in fields:
-            raw = rec[pos : pos + f.width]
-            pos += f.width
-            out[f.key] = _decode_value(raw, f.type, f.decimals)
+        for key, field_start, field_end, ftype, decimals in layout:
+            out[key] = _decode_text_value(rec[field_start:field_end], ftype, decimals)
         records.append(out)
 
     return DBFTable(nrecs=nrecs, fields=fields, records=records)

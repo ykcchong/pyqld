@@ -18,6 +18,11 @@ from __future__ import annotations
 import struct
 from collections.abc import Iterator
 
+try:
+    from ._codec_native import decode as _native_decode
+except ImportError:
+    _native_decode = None
+
 #: The single-byte XOR key used by ``CQuanFileEncrypt`` (ASCII ``'e'``).
 XOR_KEY: int = 0x65
 
@@ -113,6 +118,14 @@ def iter_blocks(data: bytes) -> Iterator[tuple[int, bytes, bytes]]:
 # ---------------------------------------------------------------------------
 
 
+def _lzss_decode_python(data: bytes) -> bytes:
+    """Reference decoder and fallback for installations without the extension."""
+    out = bytearray()
+    for _off, flag_buf, token_buf in iter_blocks(data):
+        lzss_decode_block(flag_buf, token_buf, out)
+    return bytes(out)
+
+
 def lzss_decode(data: bytes) -> bytes:
     """Decompress the LZSS layer of an entire stream payload.
 
@@ -126,10 +139,9 @@ def lzss_decode(data: bytes) -> bytes:
     bytes
         The LZSS-decompressed (still XOR-encrypted) data.
     """
-    out = bytearray()
-    for _off, flag_buf, token_buf in iter_blocks(data):
-        lzss_decode_block(flag_buf, token_buf, out)
-    return bytes(out)
+    if _native_decode is not None and isinstance(data, bytes):
+        return _native_decode(data, 0)
+    return _lzss_decode_python(data)
 
 
 def decrypt(buf: bytes, key: int = XOR_KEY) -> bytes:
@@ -165,4 +177,6 @@ def decode_quan_stream(data: bytes) -> bytes:
     bytes
         The fully decoded plaintext (dBase or INI content).
     """
-    return decrypt(lzss_decode(data))
+    if _native_decode is not None and isinstance(data, bytes):
+        return _native_decode(data, XOR_KEY)
+    return decrypt(_lzss_decode_python(data))

@@ -6,12 +6,14 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any
 
 from .ini import IniBlob, IniSection
 
 
+@lru_cache(maxsize=4096)
 def _snake_case(value: str) -> str:
     value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
@@ -175,6 +177,7 @@ class CalibrationCurve:
 
 
 ReportValue = str | tuple[str, ...]
+_REPORT_SECTION = re.compile(r"--\s*(.+?)\s*--")
 
 
 class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
@@ -187,7 +190,10 @@ class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
         current = parsed.setdefault(section_name, {})
 
         for line in text.splitlines():
-            section_match = re.fullmatch(r"--\s*(.+?)\s*--", line.strip())
+            stripped = line.strip()
+            section_match = (
+                _REPORT_SECTION.fullmatch(stripped) if stripped.startswith("--") else None
+            )
             if section_match:
                 name = section_match.group(1).strip().lower()
                 if name.startswith("end "):

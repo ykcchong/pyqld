@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, lru_cache
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
@@ -44,8 +44,16 @@ from .quantitation import LinearCalibration
 # ---------------------------------------------------------------------------
 
 
+@lru_cache(maxsize=4096)
 def _snake_case(name: str) -> str:
+    # Table rows reuse column names; bound retention across unrelated files.
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+@lru_cache(maxsize=256)
+def _record_keys(names: tuple[str, ...]) -> Mapping[str, str]:
+    """Share immutable aliases for identical ordered row schemas."""
+    return MappingProxyType({_snake_case(key): key for key in names})
 
 
 class _Record(Mapping[str, Any]):
@@ -55,7 +63,7 @@ class _Record(Mapping[str, Any]):
 
     def __init__(self, data: dict[str, Any], index: int) -> None:
         self._data = data
-        self._keys = {_snake_case(key): key for key in data}
+        self._keys = _record_keys(tuple(data))
         self.index = index
 
     def __getitem__(self, key: str) -> Any:
