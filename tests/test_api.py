@@ -7,12 +7,62 @@ from pathlib import Path
 import pytest
 
 import pyqld
-from pyqld import Dataset
+from pyqld import Dataset, MRMTransition
 
 
 def test_read_is_public() -> None:
     assert "read" in pyqld.__all__
     assert callable(pyqld.read)
+
+
+def test_read_chromatograms_with_inconsistent_transition_spacing() -> None:
+    fixture = Path(__file__).parents[1] / "data" / "UOS 20261013 BEH Amide PS.qld"
+    if not fixture.is_file():
+        pytest.skip("repository fixture is not available")
+
+    dataset = pyqld.read(fixture)
+
+    assert len(dataset.samples) == 21
+    assert len(dataset.compounds) == 18
+    assert len(dataset.chromatograms) == 567
+    for acquisition in dataset.acquisitions:
+        assert len(acquisition.mrm_channels) == 27
+        for name, function, transition in [
+            ("Sialyl-OS", 18, "1200.4>1099.4"),
+            ("HexNAc-OS", 8, "771.3>568.4"),
+        ]:
+            channel = next(
+                channel for channel in acquisition.mrm_channels
+                if channel.function == function
+                and channel.transition == MRMTransition.parse(transition)
+            )
+            assert channel.number == 2
+            assert dataset[acquisition.index, name].quantifier_chromatogram is not None
+    for sample_index, acquisition in enumerate(dataset.acquisitions):
+        acquired = {
+            (channel.function, channel.transition) for channel in acquisition.mrm_channels
+        }
+        for trace in dataset.chromatograms[sample_index * 27 : (sample_index + 1) * 27]:
+            assert (trace.function, MRMTransition.parse(trace.trace)) in acquired
+    for pair in dataset.pairs():
+        assert len(pair.chromatograms) == len(pair.compound.traces)
+        assert pair.quantifier_chromatogram is not None
+        for transition, chromatogram in zip(
+            pair.compound.traces, pair.chromatograms, strict=True
+        ):
+            assert pair.chromatogram(transition) is chromatogram
+            assert chromatogram.function == pair.compound.function
+            assert pair.sample.index * 27 <= chromatogram.index < (pair.sample.index + 1) * 27
+            assert (
+                len(chromatogram.times) == len(chromatogram.intensities) == chromatogram.scans
+            )
+            assert chromatogram.scans > 0
+            assert dataset.results_for(
+                pair.sample, compound=pair.compound, transition=transition
+            )
+        if pair.compound.has_qualifier:
+            assert pair.qualifier_chromatogram is not None
+    assert dataset.qld.to_bytes() == fixture.read_bytes()
 
 
 def test_read_real_fixture() -> None:

@@ -37,3 +37,7 @@ Thumbs.db
 *.csv
 *.xlsx
 reports/
+
+data/
+
+test_scripts/

@@ -16,6 +16,114 @@ def _section(name: str, **values: str) -> IniSection:
     return section
 
 
+@pytest.mark.parametrize(
+    "method_trace,stored_trace",
+    [
+        ("100>50", "100 > 50"),
+        (" 100 > 50 ", "100>50"),
+        ("100\t> 50", "100 >\t50"),
+        ("100 > 50", "100 > 50"),
+        ("100.00 > 50.000", "100>50"),
+        ("1e2 > 5.0e1", "100.0 > 50"),
+    ],
+)
+def test_transition_spacing_is_ignored_in_lookups(method_trace, stored_trace) -> None:
+    qld = QLDFile(path="test.qld")
+    qld.tables = {
+        "QD1": DBFTable(2, [], [{"ID": "first"}, {"ID": "second"}]),
+        "QD2": DBFTable(2, [], [
+            {"SAMPLE_ID": sample, "NAME": "Analyte", "RAW_FUNC": 3,
+             "QUAN_TRACE": stored_trace}
+            for sample in ("first", "second")
+        ]),
+        "QD3": DBFTable(1, [], [{
+            "NAME": "Analyte", "RAW_FUNC": 3, "QUAN_TRACE": method_trace,
+            "SEC_EXIST": True, "SEC_TRACE": "100>25",
+        }]),
+        "QD5": [
+            _section("Chromatogram", Function=function, Trace=trace)
+            for _ in range(2)
+            for function, trace in [
+                ("4", stored_trace), ("3", stored_trace), ("3", "100 > 25"),
+            ]
+        ],
+    }
+    dataset = Dataset(qld)
+
+    for sample_index in range(2):
+        pair = dataset[sample_index, 0]
+        quantifier, qualifier = dataset.chromatograms[
+            sample_index * 3 + 1 : sample_index * 3 + 3
+        ]
+        assert pair.chromatograms == [quantifier, qualifier]
+        assert pair.quantifier_chromatogram is quantifier
+        assert pair.qualifier_chromatogram is qualifier
+        assert pair.chromatogram(method_trace) is quantifier
+        assert pair.chromatogram("100>25") is qualifier
+        assert pair.chromatogram("100>5") is None
+        assert dataset.results_for(
+            sample_index, function=3, transition=method_trace
+        ) == pair.results
+        assert dataset.results_for(sample_index, function=4, transition=method_trace) == []
+        assert quantifier.trace == stored_trace
+        assert pair.result.transition == stored_trace
+        assert pair.compound.quan_trace == method_trace
+
+
+def test_trace_labels_do_not_lose_internal_spaces() -> None:
+    qld = QLDFile(path="test.qld")
+    qld.tables = {
+        "QD1": DBFTable(1, [], [{"ID": "sample"}]),
+        "QD3": DBFTable(1, [], [
+            {"NAME": "Analyte", "RAW_FUNC": 1, "QUAN_TRACE": "A B"},
+        ]),
+        "QD5": [
+            _section("Chromatogram", Function="1", Trace="AB"),
+            _section("Chromatogram", Function="1", Trace="A B"),
+        ],
+    }
+    pair = Dataset(qld)[0, 0]
+    assert pair.chromatograms == [pair.dataset.chromatograms[1]]
+    assert pair.chromatogram("AB") is None
+
+
+@pytest.mark.parametrize("trace", ["TIC", "568.20 > 347.20"])
+def test_duplicate_chromatograms_are_not_silently_discarded(trace) -> None:
+    qld = QLDFile(path="test.qld")
+    qld.tables = {
+        "QD1": DBFTable(1, [], [{"ID": "sample"}]),
+        "QD3": DBFTable(1, [], [
+            {"NAME": "Analyte", "RAW_FUNC": 1, "QUAN_TRACE": trace},
+        ]),
+        "QD5": [
+            _section("Chromatogram", Function="1", Trace=trace),
+            _section("Chromatogram", Function="1", Trace=trace.replace(".20", ".2")),
+        ],
+    }
+    dataset = Dataset(qld)
+    assert len(dataset.chromatograms) == 2
+    with pytest.raises(ValueError, match="ambiguous chromatogram.*sample"):
+        _ = dataset[0, 0].chromatograms
+    with pytest.raises(ValueError, match="ambiguous chromatogram.*sample"):
+        _ = dataset[0, 0].quantifier_chromatogram
+    with pytest.raises(ValueError, match="ambiguous chromatogram.*sample"):
+        dataset[0, 0].chromatogram(trace)
+
+
+def test_different_numeric_masses_are_not_merged() -> None:
+    qld = QLDFile(path="test.qld")
+    qld.tables = {
+        "QD1": DBFTable(1, [], [{"ID": "sample"}]),
+        "QD3": DBFTable(1, [], [
+            {"NAME": "Analyte", "RAW_FUNC": 1, "QUAN_TRACE": "100.000000000000001>50"},
+        ]),
+        "QD5": [
+            _section("Chromatogram", Function="1", Trace="100.000000000000002 > 50"),
+        ],
+    }
+    assert Dataset(qld)[0, 0].chromatograms == []
+
+
 def test_pair_uses_sample_and_compound_peak_index() -> None:
     qld = QLDFile(path="test.qld")
     qld.tables = {

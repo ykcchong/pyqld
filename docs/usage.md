@@ -131,6 +131,51 @@ Chromatograms are associated using sample-major stream order plus the method's
 function and trace fields. Spectra are associated by function; `rt_window`
 optionally filters around the pair's primary retention time.
 
+### Numeric MRM matching and acquisition evidence
+
+MRM transitions are matched as exact `Decimal` precursor/product m/z pairs,
+within the owning sample and acquisition function. For example, `568.20 > 347.20`,
+`568.2>347.2`, and `5.682e2 > 3.472e2` identify the same transition. This applies
+to chromatogram lookup, result filtering, and peak editing. No mass tolerance
+or rounding is applied: genuinely different masses remain distinct.
+Other traces, such as `TIC`, retain case-sensitive text matching. Original labels,
+decoded signal arrays, and raw streams remain unchanged.
+
+```python
+from pyqld import MRMTransition
+
+transition = MRMTransition.parse(compound.quantifier_transition)
+if transition is not None:
+    print(transition.precursor_mz, transition.product_mz)  # Decimal values
+
+acquisition = dataset.acquisition(sample)
+if acquisition is not None:
+    for channel in acquisition.mrm_channels:
+        print(channel.function, channel.number, channel.transition)
+        print(channel.ionization_mode, channel.collision_energy)
+```
+
+For recognized `Function N` / `MRM of N channels` tables in the embedded
+acquisition report, chromatogram lookup additionally checks that the numeric
+transition is declared for that sample's function. Channel numbers are not
+quantifier/qualifier roles: those roles come from the quantitation method.
+A missing quantifier is returned as `None`, never replaced with the qualifier.
+
+Multiple stored chromatograms for the same sample/function/transition, or
+multiple acquisition channels with that same function/transition, raise
+`ValueError` rather than choosing the first. A mismatch with a recognized
+acquisition table also raises `ValueError`. A recognized but malformed or
+unsupported MRM table raises `ValueError` when channels or an MRM chromatogram
+are requested. All stored traces remain available through
+`dataset.chromatograms` for inspection.
+
+If acquisition metadata is absent, its format is unrecognized, or the requested
+function has no recognized MRM table, numeric matching still works but is
+**not acquisition-validated**. `acquisition.mrm_channels` exposes only recognized
+channels (an empty tuple when none are recognized). Parsing a transition label
+alone is not independent acquisition evidence; even the embedded report describes
+configured channels, not a verification against the original raw instrument file.
+
 ## Iterate a batch
 
 ```python
@@ -202,6 +247,30 @@ Set `include_raw=True` only when decoded stream bytes are required. In a single
 JSON document they are base64 encoded; directory export writes binary files.
 Large chromatogram and spectrum streams can be split into one JSON file per
 section with `split_sections=True`.
+
+## Pickle and Spyder
+
+Datasets, record objects, compound-result views, chromatograms, and acquisition
+reports support Python `pickle` and `cloudpickle` (used by Spyder's Variable
+Explorer). Record aliases and acquisition-report mappings remain read-only
+after restoration, and references within a serialized dataset remain linked.
+
+```python
+import pickle
+
+restored = pickle.loads(pickle.dumps(dataset))
+print(restored.samples[0].id)
+```
+
+Only unpickle trusted data: loading a pickle can execute arbitrary code.
+Pickles are version-sensitive Python object snapshots, not a stable archival
+format. Use QLD for preserving source data or JSON for interoperable exports.
+`cloudpickle` is optional at runtime and is included in the development
+dependencies for compatibility tests.
+
+After updating pyqld for Spyder, restart Spyder and its kernel so both processes
+use the updated package. If they use different Python environments, update
+pyqld in both.
 
 ## Command line
 

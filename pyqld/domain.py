@@ -6,7 +6,8 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from decimal import Decimal
+from functools import cached_property, lru_cache
 from types import MappingProxyType
 from typing import Any
 
@@ -178,6 +179,109 @@ class CalibrationCurve:
 
 ReportValue = str | tuple[str, ...]
 _REPORT_SECTION = re.compile(r"--\s*(.+?)\s*--")
+_DECIMAL_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_MRM_TRANSITION = re.compile(rf"\s*({_DECIMAL_NUMBER})\s*>\s*({_DECIMAL_NUMBER})\s*")
+_FUNCTION_HEADING = re.compile(r"Function\s+([0-9]+)")
+_MRM_FUNCTION = re.compile(r"MRM of ([0-9]+) channels?")
+_CHANNEL_HEADING = re.compile(
+    r"Chan\s+Reaction\s+Dwell\(secs\)\s+Cone\s+Volt\.\s+Col\.Energy\s+Delay\(secs\)(?:\s+.*)?"
+)
+_CHANNEL_ROW = re.compile(
+    rf"([0-9]+)\s*:\s*({_DECIMAL_NUMBER}\s*>\s*{_DECIMAL_NUMBER})"
+    rf"\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})(?:\s+.*)?"
+)
+
+
+@dataclass(frozen=True)
+class MRMTransition:
+    """Exact configured precursor/product m/z, not measured spectral masses."""
+
+    precursor_mz: Decimal
+    product_mz: Decimal
+
+    def __post_init__(self) -> None:
+        for mass in (self.precursor_mz, self.product_mz):
+            if not isinstance(mass, Decimal):
+                raise TypeError("MRM masses must be Decimal values")
+            if not mass.is_finite() or mass <= 0:
+                raise ValueError("MRM masses must be finite and positive")
+
+    @classmethod
+    def parse(cls, trace: str) -> MRMTransition | None:
+        """Parse a numeric MRM label; return None for other trace syntax."""
+        match = _MRM_TRANSITION.fullmatch(trace)
+        if match is None:
+            return None
+        return cls(Decimal(match.group(1)), Decimal(match.group(2)))
+
+
+@dataclass(frozen=True)
+class AcquisitionChannel:
+    """One MRM channel explicitly declared in an embedded acquisition report."""
+
+    function: int
+    number: int
+    transition: MRMTransition
+    ionization_mode: str
+    collision_energy: Decimal
+
+
+def _parse_mrm_channels(text: str) -> tuple[AcquisitionChannel, ...]:
+    lines = [line.strip() for line in text.splitlines()]
+    headings = [
+        (index, int(match.group(1)))
+        for index, line in enumerate(lines)
+        if (match := _FUNCTION_HEADING.fullmatch(line)) is not None
+    ]
+    channels: list[AcquisitionChannel] = []
+    seen_functions: set[int] = set()
+    for position, (start, function) in enumerate(headings):
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        block = lines[start + 1 : end]
+        function_type = next(
+            (line.partition(":")[2].strip() for line in block
+             if line.startswith("Function type:")),
+            "",
+        )
+        if not function_type.startswith("MRM"):
+            continue
+        declared = _MRM_FUNCTION.fullmatch(function_type)
+        if declared is None or not any(_CHANNEL_HEADING.fullmatch(line) for line in block):
+            raise ValueError(f"unsupported MRM acquisition table for function {function}")
+        if function in seen_functions:
+            raise ValueError(f"duplicate MRM acquisition table for function {function}")
+        seen_functions.add(function)
+        mode = next(
+            (line.partition(":")[2].strip() for line in block
+             if line.startswith("Ionization mode:")),
+            "",
+        )
+        function_channels = []
+        for line in block:
+            if re.match(r"[0-9]+\s*:", line) is None:
+                continue
+            row = _CHANNEL_ROW.fullmatch(line)
+            if row is None:
+                raise ValueError(f"invalid MRM channel in function {function}: {line!r}")
+            transition = MRMTransition.parse(row.group(2))
+            if transition is None:
+                raise ValueError(f"invalid MRM transition in function {function}: {line!r}")
+            function_channels.append(AcquisitionChannel(
+                function=function,
+                number=int(row.group(1)),
+                transition=transition,
+                ionization_mode=mode,
+                collision_energy=Decimal(row.group(5)),
+            ))
+        count = int(declared.group(1))
+        if (
+            count < 1
+            or len(function_channels) != count
+            or {channel.number for channel in function_channels} != set(range(1, count + 1))
+        ):
+            raise ValueError(f"incomplete or duplicate MRM channels in function {function}")
+        channels.extend(function_channels)
+    return tuple(channels)
 
 
 class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
@@ -221,6 +325,14 @@ class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
             {name: MappingProxyType(values) for name, values in parsed.items()}
         )
 
+    def __reduce__(self) -> tuple[type[AcquisitionReport], tuple[str]]:
+        return type(self), (self.text,)
+
+    @cached_property
+    def mrm_channels(self) -> tuple[AcquisitionChannel, ...]:
+        """Recognized acquisition channels; malformed MRM tables raise ValueError."""
+        return _parse_mrm_channels(self.text)
+
     def __getitem__(self, key: str) -> Mapping[str, ReportValue]:
         return self._sections[key]
 
@@ -240,6 +352,10 @@ class AcquisitionInfo:
     number_of_functions: int
     report: AcquisitionReport
     header_bytes: bytes
+
+    @property
+    def mrm_channels(self) -> tuple[AcquisitionChannel, ...]:
+        return self.report.mrm_channels
 
     @property
     def header(self) -> Mapping[str, ReportValue]:

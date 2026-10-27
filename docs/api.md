@@ -179,7 +179,17 @@ Common convenience properties:
 * `Integration`: peak boundaries, scans, area, and height.
 * `Quality`: quality score, noise, ion ratio, limits, and named failure flags.
 * `AcquisitionInfo`: sample ID, instrument, acquisition time, parsed report,
-    function count, and preserved binary header.
+    function count, preserved binary header, and `mrm_channels`.
+* `MRMTransition`: immutable `precursor_mz` and `product_mz` as positive, finite
+    `Decimal` values. `MRMTransition.parse(label)` returns a transition for a
+    numeric `precursor > product` label, or `None` for other syntax. Numeric
+    nonpositive masses raise `ValueError`; construction requires `Decimal`
+    values, not binary floats. Equality and hashing ignore decimal formatting
+    without applying a mass tolerance.
+* `AcquisitionChannel`: immutable `function`, `number`, `transition`,
+    `ionization_mode`, and `collision_energy` (`Decimal`) from a recognized
+    embedded MRM acquisition table. `number` is the acquisition channel number,
+    not a quantifier/qualifier designation. Missing ionization mode is `""`.
 * `CalibrationCurve` and `CalibrationPoint`: curve model, weighting,
     coefficients, validity, concentrations, and responses.
 * `AuditEvent`: UTC timestamp, action, user text, sample/peak indexes, changed
@@ -189,6 +199,21 @@ Common convenience properties:
 
 `Peak` and `SampleCompound` remain compatibility aliases for
 `QuantitationResult` and `CompoundResult`.
+
+`AcquisitionInfo.mrm_channels` and `AcquisitionReport.mrm_channels` return
+`tuple[AcquisitionChannel, ...]`. These lazily parse recognized `Function N` /
+`MRM of N channels` acquisition tables and reject malformed, incomplete, or
+duplicate tables with `ValueError`. Unrecognized reports return an empty tuple;
+a missing function is not evidence that its transition was validated.
+
+Pair-level chromatogram lookups use sample + function + exact numeric MRM
+identity, or a text key for non-MRM traces. They validate against the embedded
+acquisition table when one is recognized for that function. Ambiguous stored
+traces, ambiguous acquisition channels, and acquisition conflicts raise
+`ValueError` with sample/function/trace context. Missing traces return `None`
+through individual accessors and are omitted from the pair's list, without
+changing quantifier/qualifier roles. Raw `Dataset.chromatograms` still retains
+all stored traces. See [matching details](usage.md#numeric-mrm-matching-and-acquisition-evidence).
 
 ## File and export API
 

@@ -264,7 +264,7 @@ def edit_peak(
     area_scale: float = 1.0,
 ) -> Dataset:
     """Reintegrate an existing result and recalculate its response/concentration."""
-    from .model import Dataset
+    from .model import Dataset, _normalize_transition
 
     if (
         not 0 <= result.index < len(dataset.results)
@@ -275,7 +275,7 @@ def edit_peak(
     matches = [
         trace
         for trace in pair.chromatograms
-        if trace.trace.strip() == result.transition.strip()
+        if _normalize_transition(trace.trace) == _normalize_transition(result.transition)
         and trace.function == result.function
     ]
     if len(matches) != 1:

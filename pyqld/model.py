@@ -33,11 +33,22 @@ from .domain import (
     AuditEvent,
     CalibrationCurve,
     Integration,
+    MRMTransition,
     Quality,
 )
 from .ini import IniBlob, IniSection
 from .qld import QLDFile, open_qld
 from .quantitation import LinearCalibration
+
+
+@lru_cache(maxsize=4096)
+def _normalize_transition(trace: str) -> MRMTransition | str:
+    """Use exact numeric MRM identities, retaining text keys for other traces."""
+    transition = MRMTransition.parse(trace)
+    return transition if transition is not None else ">".join(
+        part.strip() for part in trace.split(">")
+    )
+
 
 # ---------------------------------------------------------------------------
 # Record wrappers (dBase rows)
@@ -67,10 +78,26 @@ class _Record(Mapping[str, Any]):
         self.index = index
 
     def __getitem__(self, key: str) -> Any:
-        raw_key = key if key in self._data else self._keys.get(key)
+        data = object.__getattribute__(self, "_data")
+        keys = object.__getattribute__(self, "_keys")
+        raw_key = key if key in data else keys.get(key)
         if raw_key is None:
             raise KeyError(key)
-        return self._data[raw_key]
+        return data[raw_key]
+
+    def __getstate__(self) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        return (
+            getattr(self, "__dict__", None),
+            {"_data": self._data, "index": self.index},
+        )
+
+    def __setstate__(self, state: tuple[dict[str, Any] | None, dict[str, Any]]) -> None:
+        attributes, slots = state
+        self._data = slots["_data"]
+        self.index = slots["index"]
+        self._keys = _record_keys(tuple(self._data))
+        if attributes is not None:
+            self.__dict__.update(attributes)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self._keys)
@@ -90,7 +117,7 @@ class _Record(Mapping[str, Any]):
     def __getattr__(self, key: str) -> Any:
         try:
             return self[key]
-        except KeyError as e:
+        except (KeyError, AttributeError) as e:
             raise AttributeError(key) from e
 
     def __repr__(self) -> str:
@@ -551,8 +578,11 @@ class CompoundResult:
     @property
     def quan_chromatogram(self) -> Chromatogram | None:
         """The quantifier chromatogram, or ``None`` if missing."""
-        chrs = self.chromatograms
-        return chrs[0] if chrs else None
+        if not self.compound.quan_trace:
+            return None
+        return self.dataset._chromatogram_for(
+            self.sample, self.compound.function, self.compound.quan_trace
+        )
 
     @property
     def quantifier_chromatogram(self) -> Chromatogram | None:
@@ -561,10 +591,11 @@ class CompoundResult:
     @property
     def qual_chromatogram(self) -> Chromatogram | None:
         """The qualifier chromatogram, or ``None`` if absent."""
-        chrs = self.chromatograms
-        if len(chrs) < 2 or not self.compound.has_qualifier:
+        if not self.compound.has_qualifier:
             return None
-        return chrs[1]
+        return self.dataset._chromatogram_for(
+            self.sample, self.compound.function, self.compound.qual_trace
+        )
 
     @property
     def qualifier_chromatogram(self) -> Chromatogram | None:
@@ -572,10 +603,9 @@ class CompoundResult:
 
     def chromatogram(self, trace: str) -> Chromatogram | None:
         """Lookup a chromatogram by its ``Trace`` string."""
-        target = trace.strip()
-        for ch in self.chromatograms:
-            if ch.trace.strip() == target:
-                return ch
+        target = _normalize_transition(trace)
+        if any(_normalize_transition(value) == target for value in self.compound.traces):
+            return self.dataset._chromatogram_for(self.sample, self.compound.function, trace)
         return None
 
     def spectra(self, *, rt_window: float | None = None) -> list[Spectrum]:
@@ -781,7 +811,9 @@ class Dataset:
             self._peaks_by_pair.setdefault(key, []).append(peak)
 
         # Sample-owned media layouts
-        self._chrom_index: list[dict[tuple[int, str], Chromatogram]] = []
+        self._chrom_index: list[
+            dict[tuple[int, MRMTransition | str], list[Chromatogram]]
+        ] = []
         self._spectra_by_sample: list[list[Spectrum]] = []
         self._spectra_by_sample_function: list[dict[int, list[Spectrum]]] = []
         self._build_media_layouts()
@@ -836,8 +868,8 @@ class Dataset:
             offset = 0
             for sample_index, size in enumerate(chrom_sizes):
                 for ch in self.chromatograms[offset : offset + size]:
-                    key = (ch.function, ch.trace.strip())
-                    self._chrom_index[sample_index].setdefault(key, ch)
+                    key = (ch.function, _normalize_transition(ch.trace))
+                    self._chrom_index[sample_index].setdefault(key, []).append(ch)
                 offset += size
 
         spectrum_sizes = self._sample_table_sizes(
@@ -859,18 +891,51 @@ class Dataset:
     def _chromatograms_for(
         self, sample: Sample, compound: Compound
     ) -> list[Chromatogram]:
-        if not self._chrom_index or not (
-            0 <= sample.index < len(self._chrom_index)
-        ):
-            return []
-        idx = self._chrom_index[sample.index]
-        fn = compound.function
         out: list[Chromatogram] = []
         for trace in compound.traces:
-            ch = idx.get((fn, trace.strip()))
+            ch = self._chromatogram_for(sample, compound.function, trace)
             if ch is not None:
                 out.append(ch)
         return out
+
+    def _chromatogram_for(
+        self, sample: Sample, function: int, trace: str
+    ) -> Chromatogram | None:
+        if not self._chrom_index or not (
+            0 <= sample.index < len(self._chrom_index)
+        ):
+            return None
+        idx = self._chrom_index[sample.index]
+        transition = _normalize_transition(trace)
+        matches = idx.get((function, transition), [])
+        if not matches:
+            return None
+        context = f"sample {sample.id!r}, function {function}, trace {trace!r}"
+        if len(matches) > 1:
+            indexes = [ch.index for ch in matches]
+            raise ValueError(f"ambiguous chromatogram for {context}: indexes {indexes}")
+        if isinstance(transition, MRMTransition):
+            acquisition = self.acquisition(sample)
+            if acquisition is not None:
+                try:
+                    channels = [
+                        channel for channel in acquisition.mrm_channels
+                        if channel.function == function
+                    ]
+                except ValueError as e:
+                    raise ValueError(f"invalid acquisition metadata for {context}: {e}") from e
+                if channels:
+                    matching = [
+                        channel for channel in channels if channel.transition == transition
+                    ]
+                    if not matching:
+                        raise ValueError(f"acquisition transition mismatch for {context}")
+                    if len(matching) > 1:
+                        numbers = [channel.number for channel in matching]
+                        raise ValueError(
+                            f"ambiguous acquisition channels for {context}: channels {numbers}"
+                        )
+        return matches[0]
 
     # --------------------------------------------------------- factories
 
@@ -1049,7 +1114,9 @@ class Dataset:
         compound_name = (
             self.compound(compound).name if compound is not None else None
         )
-        normalized_transition = transition.strip() if transition is not None else None
+        normalized_transition = (
+            _normalize_transition(transition) if transition is not None else None
+        )
 
         return [
             result
@@ -1059,7 +1126,7 @@ class Dataset:
             and (function is None or result.function == function)
             and (
                 normalized_transition is None
-                or result.transition.strip() == normalized_transition
+                or _normalize_transition(result.transition) == normalized_transition
             )
             and (named is None or bool(result.compound_name) is named)
         ]

@@ -68,12 +68,14 @@ from pathlib import Path
 from .codec import XOR_KEY, decode_quan_stream, decrypt, lzss_decode
 from .dbf import DBFTable, parse_dbf
 from .domain import (
+    AcquisitionChannel,
     AcquisitionInfo,
     AcquisitionReport,
     AuditEvent,
     CalibrationCurve,
     CalibrationPoint,
     Integration,
+    MRMTransition,
     Quality,
 )
 from .ini import IniBlob, IniSection, parse_ini
@@ -120,6 +122,8 @@ __all__ = [
     "CalibrationCurve",
     "AcquisitionReport",
     "AcquisitionInfo",
+    "AcquisitionChannel",
+    "MRMTransition",
     "AuditEvent",
     "LinearCalibration",
     "PeakIntegration",

@@ -40,6 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "cloudpickle>=3.0",
     "pytest>=8.0",
     "pytest-cov",
     "ruff",

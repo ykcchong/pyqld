@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-from pyqld import read
+from pyqld import Dataset, QLDFile, read
+from pyqld.dbf import DBFTable, parse_dbf
+from pyqld.ini import IniBlob, IniSection
 from pyqld.quantitation import LinearCalibration, integrate_peak
 from pyqld.writer import edit_table_rows
 
@@ -73,6 +75,47 @@ def test_batch_edit_is_atomic() -> None:
     from pyqld.dbf import parse_dbf
 
     assert parse_dbf(data).records[0]["AREA"] == 1
+
+
+@pytest.mark.parametrize("transition", ["100>50", "100 > 50", "100.00>50.000", "1e2 > 5e1"])
+def test_edit_peak_matches_transition_spacing(transition: str) -> None:
+    fields = [
+        ("SAMPLE_ID", "C", 10, 0), ("NAME", "C", 10, 0),
+        ("RAW_FUNC", "N", 3, 0), ("QUAN_TRACE", "C", 20, 0),
+        ("R_CALC", "C", 2, 0),
+    ]
+    numeric = [
+        "START_RT", "END_RT", "FOUND_RT", "ST_HEIGHT", "EN_HEIGHT", "AREA",
+        "HEIGHT", "ST_SCAN", "EN_SCAN", "FOUND_SCAN", "RESPONSE", "ABS_RESP",
+        "ANAL_CONC",
+    ]
+    fields += [(name, "N", 12, 4) for name in numeric]
+    fields += [("VALID_CONC", "L", 1, 0), ("R_AH", "C", 1, 0), ("MOD_TEXT", "C", 80, 0)]
+    data = _build_dbf(
+        fields,
+        [["sample", "Analyte", 3, transition, "ES"] + [0] * len(numeric) + [False, "", ""]],
+    )
+    trace = IniSection("Chromatogram", [("Function", "3"), ("Trace", "100 > 50")])
+    for name, values in [("Times", [0.0, 1.0, 2.0]), ("Intensities", [0.0, 4.0, 0.0])]:
+        trace.add(name, IniSection(name, [("__blob__", IniBlob(12, values, "float32"))]))
+    qld = QLDFile(path="test.qld", streams={"QD2": data}, _source=b"test")
+    qld.tables = {
+        "QD1": DBFTable(1, [], [{"ID": "sample"}]),
+        "QD2": parse_dbf(data),
+        "QD3": DBFTable(1, [], [{
+            "NAME": "Analyte", "RAW_FUNC": 3, "QUAN_TRACE": "100>50",
+        }]),
+        "QD5": [trace],
+    }
+    original = Dataset(qld)
+
+    edited = original.edit_peak(original.results[0], 0, 2, LinearCalibration(2))
+
+    assert edited.results[0].area == pytest.approx(4)
+    assert edited.results[0].concentration == pytest.approx(2)
+    assert original.results[0].area == 0
+    assert edited.results[0].transition == transition
+    assert edited.chromatograms[0].to_dict() == original.chromatograms[0].to_dict()
 
 
 def test_real_peak_quantitation_export_and_reopen(tmp_path) -> None:
