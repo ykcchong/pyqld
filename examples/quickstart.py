@@ -58,14 +58,17 @@ def main() -> None:
         detected = 0
         for c in ds.compounds[:10]:
             pair = ds.pair(sample, c)
+            if pair.selection_status != "primary":
+                print(f"  {c.name:20s}  {pair.selection_status}")
+                continue
             area = pair.area
             rt = pair.retention_time
             status = "detected" if area and area > 0 else "not detected"
             if area and area > 0:
                 detected += 1
             print(
-                f"  {c.name:20s}  area={area:>12}  "
-                f"rt={rt:>8}  {status}"
+                f"  {c.name:20s}  area={str(area):>12}  "
+                f"rt={str(rt):>8}  {status}"
             )
         print(f"  ... ({detected} detected in first 10 compounds)")
 

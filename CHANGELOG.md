@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Read-only dataset validation with structured errors/warnings for source
+  integrity, ownership, result selection, signals and acquisition metadata
+- Sample/function/transition chromatogram queries, cached read-only NumPy
+  signal arrays and inclusive chromatogram time-window views
+- Explicit result-selection policies and selection status
+- Calibration fit diagnostics and explicit refitting of selected stored standards
+- Documentation for calibration, reintegration, requantitation and result export
+
+- Structured acquisition functions, vendor-number channel lookup, and exact
+  transition filtering, with dwell time, cone voltage, delay and compound labels
+- Acquisition coverage guide and compact acquisition/report summaries
+
 - Copy-on-write `with_changes()`, QLD serialization, and atomic `save()` APIs
 - Fixed-width DBF validation and preservation of unedited OLE streams
 - GUI field editing, revision checks, bounded undo/redo, and QLD downloads
@@ -20,6 +32,14 @@ All notable changes to this project will be documented in this file.
 - PEP 561 marker for downstream type checking
 
 ### Changed
+
+- Resolve results to injection indexes using audited row boundaries and raw-file
+  identity; repeated sample labels no longer merge results or silently select
+  the last sample
+- Require a unique active primary for result convenience properties; implicit
+  first-row fallback now requires an explicit selection policy
+- Reject unresolved media ownership and mismatched/nonfinite signal iteration
+- Add strict INI structural checks and ensure malformed child headers make progress
 
 - Corrected the documented dBase header layout
 - Marked earlier parser packages as legacy research code

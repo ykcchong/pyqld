@@ -82,6 +82,9 @@ def test_acquisition_info_parses_report_and_preserves_header_bytes() -> None:
     assert info.report["header"]["sample_id"] == "S1"
     assert info.report["header"]["instrument"] == "TQ"
     assert info.header_bytes == b"\x01\x00A"
+    assert repr(info) == "<AcquisitionInfo index=0 sample_id='S1' instrument='TQ' functions=2>"
+    assert "header_bytes" not in repr(info)
+    assert repr(info.report).startswith("<AcquisitionReport sections=")
 
 
 def test_audit_event_converts_filetime() -> None:

@@ -74,7 +74,7 @@ def _dataset() -> Dataset:
         "QD1": DBFTable(1, [], [{"ID": "sample", "FILE_NAME": "sample.raw"}]),
         "QD2": DBFTable(1, [], [{
             "SAMPLE_ID": "sample", "NAME": "Analyte", "RAW_FUNC": 3,
-            "QUAN_TRACE": "100 > 50", "AREA": 4.0,
+            "QUAN_TRACE": "100 > 50", "AREA": 4.0, "METH_PEAK": 0,
         }]),
         "QD3": DBFTable(1, [], [{
             "NAME": "Analyte", "RAW_FUNC": 3, "QUAN_TRACE": "100>50",
@@ -138,12 +138,32 @@ def test_acquisition_report_roundtrip(serializer) -> None:
         restored["header"]["sample_id"] = "changed"
 
 
+@pytest.mark.parametrize("warm_caches", [False, True])
+def test_acquisition_function_roundtrip(serializer, warm_caches) -> None:
+    report = AcquisitionReport(
+        "Function 5\nStart and End Time(mins): 1 to 2\n"
+        "Ionization mode: ES-\nFunction type: MRM of 1 channel\n"
+        "Chan Reaction Dwell(secs) Cone Volt. Col.Energy Delay(secs) Compound\n"
+        "1 : 100 > 50 0.036 75 60 Auto Analyte\n"
+    )
+    function = report.function(5)
+    if warm_caches:
+        _ = function.start_time, function.end_time, function.mrm_channels, report.mrm_channels
+    restored = serializer.loads(serializer.dumps(report))
+    restored_function = serializer.loads(serializer.dumps(function))
+    assert restored.function(5) == restored_function == function
+    assert restored_function.start_time == function.start_time
+    assert restored_function.end_time == function.end_time
+    assert restored_function.channel(1) == function.channel(1)
+    assert restored.channels_for(function=5, transition="100>50") == function.mrm_channels
+
+
 def test_real_dataset_roundtrip(serializer) -> None:
     fixture = Path(__file__).parents[1] / "data" / "UOS 20261013 BEH Amide PS.qld"
     if not fixture.is_file():
         pytest.skip("repository fixture is not available")
     original = read(fixture)
-    _ = original[0, 0].result.integration, original[0, 0].result.quality
+    _ = original[1, 0].result.integration, original[1, 0].result.quality
     _ = original.method.calibration_curves, original.method.audit_events
 
     restored = serializer.loads(serializer.dumps(original))
@@ -153,7 +173,12 @@ def test_real_dataset_roundtrip(serializer) -> None:
     assert len(restored.compounds) == 18
     assert len(restored.chromatograms) == 567
     for before, after in zip(original.pairs(), restored.pairs(), strict=True):
-        assert after.result.to_dict() == before.result.to_dict()
+        assert after.selection_status == before.selection_status
+        expected_row = before.select_result(policy="first", include_deleted=True)
+        actual_row = after.select_result(policy="first", include_deleted=True)
+        assert (actual_row.to_dict() if actual_row is not None else None) == (
+            expected_row.to_dict() if expected_row is not None else None
+        )
         assert len(after.chromatograms) == len(before.chromatograms)
         for expected, actual in zip(before.chromatograms, after.chromatograms, strict=True):
             assert actual.to_dict() == expected.to_dict()

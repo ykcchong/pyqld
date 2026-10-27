@@ -110,13 +110,14 @@ class IniSection:
 class _Cursor:
     """Position-aware byte cursor with EOL handling."""
 
-    __slots__ = ("data", "pos", "eol", "eol_len")
+    __slots__ = ("data", "pos", "eol", "eol_len", "issues")
 
     def __init__(self, data: bytes, eol: bytes) -> None:
         self.data = data
         self.pos = 0
         self.eol = eol
         self.eol_len = len(eol)
+        self.issues: list[str] = []
 
     def at_end(self) -> bool:
         return self.pos >= len(self.data)
@@ -198,6 +199,8 @@ def _parse_section_body(cur: _Cursor, section: IniSection) -> None:
             and first_byte not in (0x09, 0x0A, 0x0D)
         ):
             cur.pos += 8
+            if cur.pos + size > len(cur.data):
+                cur.issues.append(f"truncated blob in {section.name!r} at byte {cur.pos}")
             payload = cur.data[cur.pos : cur.pos + size]
             cur.pos += size
             cur.read_eol()
@@ -222,6 +225,9 @@ def _parse_section_body(cur: _Cursor, section: IniSection) -> None:
             child = _parse_section(cur)
             if child is not None:
                 section.add(child.name, child)
+            else:
+                cur.issues.append(f"invalid child section at byte {cur.pos}")
+                cur.read_line()  # malformed headers must still make progress
             continue
         line = cur.read_line()
         if not line:
@@ -231,6 +237,7 @@ def _parse_section_body(cur: _Cursor, section: IniSection) -> None:
             section.add(key.decode("latin-1"), value.decode("latin-1"))
         else:
             section.add(line.decode("latin-1"), "")
+    cur.issues.append(f"missing closing brace for section {section.name!r}")
 
 
 def _consume_close(cur: _Cursor) -> None:
@@ -244,7 +251,9 @@ def _consume_close(cur: _Cursor) -> None:
         if b in (b"\r", b"\n"):
             cur.read_eol()
             continue
+        cur.issues.append(f"missing closing brace at byte {cur.pos}")
         return
+    cur.issues.append("missing closing brace at end of blob")
 
 
 def _parse_section(cur: _Cursor) -> IniSection | None:
@@ -271,7 +280,9 @@ def _parse_section(cur: _Cursor) -> IniSection | None:
 # ---------------------------------------------------------------------------
 
 
-def parse_ini(data: bytes, eol: bytes | None = None) -> list[IniSection]:
+def parse_ini(
+    data: bytes, eol: bytes | None = None, *, strict: bool = False,
+) -> list[IniSection]:
     """Parse an INI-style TargetLynx stream and return the top-level sections.
 
     Parameters
@@ -281,6 +292,9 @@ def parse_ini(data: bytes, eol: bytes | None = None) -> list[IniSection]:
     eol : bytes, optional
         Line ending to use. Defaults to ``b"\\r\\n"`` if CRLF is found in
         the first kilobyte, otherwise ``b"\\n"``.
+    strict : bool
+        Raise ValueError on truncated blobs, missing braces or invalid sections.
+        The default preserves the tolerant parser behavior.
 
     Returns
     -------
@@ -300,10 +314,14 @@ def parse_ini(data: bytes, eol: bytes | None = None) -> list[IniSection]:
             cur.read_eol()
             continue
         if b != b"[":
+            cur.issues.append(f"unexpected content at byte {cur.pos}")
             break
         sec = _parse_section(cur)
         if sec is None:
+            cur.issues.append(f"invalid section at byte {cur.pos}")
             break
         sections.append(sec)
 
+    if strict and cur.issues:
+        raise ValueError("; ".join(cur.issues))
     return sections

@@ -2,11 +2,84 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from pyqld import CompoundResult, Dataset, QLDFile, SampleCompound
 from pyqld.dbf import DBFTable
 from pyqld.ini import IniSection
+
+
+def _repeated_samples(*, raw_names=True, audit=False) -> Dataset:
+    rows = [
+        {"SAMPLE_ID": "repeat", "NAME": "A", "AREA": area, "METH_PEAK": 0,
+         **({"RAW_NAME": file} if raw_names else {})}
+        for file, area in [("first.raw", 10), ("second.raw", 20)]
+    ]
+    qld = QLDFile(path="test.qld", tables={
+        "QD1": DBFTable(2, [], [
+            {"ID": "repeat", "FILE_NAME": "first.raw"},
+            {"ID": "repeat", "FILE_NAME": "second.raw"},
+        ]),
+        "QD2": DBFTable(2, [], rows),
+        "QD3": DBFTable(1, [], [{"NAME": "A"}]),
+    })
+    if audit:
+        qld.tables["qld"] = [IniSection("Peaks", [
+            ("PeakList", _section("PeakList", TableID=str(index), TableSize="1"))
+            for index in (1, 2)
+        ])]
+    return Dataset(qld)
+
+
+@pytest.mark.parametrize("raw_names,audit", [(True, False), (False, True), (True, True)])
+def test_repeated_sample_ids_keep_injection_results_separate(raw_names, audit) -> None:
+    dataset = _repeated_samples(raw_names=raw_names, audit=audit)
+    assert dataset[0, 0].area == 10
+    assert dataset[1, 0].area == 20
+    assert dataset.results_for("second.raw") == [dataset.results[1]]
+    assert dataset.result_sample(dataset.results[0]) is dataset.samples[0]
+    assert dataset.result_sample(dataset.results[1]) is dataset.samples[1]
+    with pytest.raises(ValueError, match="ambiguous sample"):
+        dataset.sample("repeat")
+    with pytest.raises(ValueError, match="ambiguous sample"):
+        dataset.get_sample("repeat")
+    assert dataset.get_sample("absent") is None
+
+
+def test_ambiguous_result_ownership_is_never_inferred_from_equal_counts() -> None:
+    dataset = _repeated_samples(raw_names=False)
+    assert dataset.unresolved_results == list(dataset.results)
+    assert dataset.result_sample(dataset.results[0]) is None
+    with pytest.raises(ValueError, match="unresolved result ownership"):
+        _ = dataset[0, 0].results
+    with pytest.raises(ValueError, match="unresolved result ownership"):
+        dataset.results_for(1)
+
+
+def test_conflicting_audit_and_raw_file_identity_remains_unresolved() -> None:
+    qld = _repeated_samples(audit=True).qld
+    qld.tables["QD2"].records.reverse()
+    dataset = Dataset(qld)
+    assert len(dataset.unresolved_results) == 2
+
+
+def test_real_repeated_injections_have_distinct_results() -> None:
+    from pyqld import read
+
+    fixture = Path(__file__).parents[1] / "data" / "UOS 20261013 BEH Amide PS.qld"
+    if not fixture.exists():
+        pytest.skip("repository fixture unavailable")
+    dataset = read(fixture)
+    first, second = dataset[1, 0], dataset[18, 0]
+    assert first.result.index == 398
+    assert second.result.index == 3244
+    assert first.area == pytest.approx(46253.121)
+    assert second.area == pytest.approx(41833.172)
+    assert not dataset.unresolved_results
+    for result in dataset.results:
+        assert dataset.result_sample(result).file_name == result.raw_file_name
 
 
 def _section(name: str, **values: str) -> IniSection:
@@ -33,7 +106,7 @@ def test_transition_spacing_is_ignored_in_lookups(method_trace, stored_trace) ->
         "QD1": DBFTable(2, [], [{"ID": "first"}, {"ID": "second"}]),
         "QD2": DBFTable(2, [], [
             {"SAMPLE_ID": sample, "NAME": "Analyte", "RAW_FUNC": 3,
-             "QUAN_TRACE": stored_trace}
+             "QUAN_TRACE": stored_trace, "METH_PEAK": 0}
             for sample in ("first", "second")
         ]),
         "QD3": DBFTable(1, [], [{
@@ -319,3 +392,48 @@ def test_method_domain_values_are_cached() -> None:
     assert method[0].calibration is method[0].calibration
     assert method.calibration_curves is method.calibration_curves
     assert method.audit_events is method.audit_events
+
+
+def test_result_selection_requires_a_unique_active_primary() -> None:
+    qld = _repeated_samples().qld
+    rows = qld.tables["QD2"].records
+    rows[:] = [
+        {"SAMPLE_ID": "repeat", "RAW_NAME": "first.raw", "NAME": "A",
+         "METH_PEAK": marker, "AREA": area, "DELETED_PK": deleted}
+        for marker, area, deleted in [(0, 99, True), (1, 10, False), (0, 20, False)]
+    ]
+    pair = Dataset(qld)[0, 0]
+    assert pair.selection_status == "primary"
+    assert pair.result.index == 2
+    assert pair.area == 20
+    assert pair.select_result(policy="first").index == 1
+    assert pair.select_result(policy="first", include_deleted=True).index == 0
+    with pytest.raises(ValueError, match="ambiguous primary"):
+        pair.select_result(include_deleted=True)
+    rows[1]["METH_PEAK"] = 0
+    pair = Dataset(qld)[0, 0]
+    assert pair.selection_status == "ambiguous"
+    with pytest.raises(ValueError, match="ambiguous primary"):
+        _ = pair.area
+    assert "CompoundResult" in repr(pair)  # diagnostics must remain inspectable
+
+
+def test_missing_primary_marker_and_explicit_legacy_fallback() -> None:
+    qld = _repeated_samples().qld
+    del qld.tables["QD2"].records[0]["METH_PEAK"]
+    pair = Dataset(qld)[0, 0]
+    assert pair.selection_status == "no_primary"
+    with pytest.raises(ValueError, match="no primary"):
+        _ = pair.result
+    assert pair.select_result(policy="primary_or_first").area == 10
+    with pytest.raises(ValueError, match="selection policy"):
+        pair.select_result(policy="unknown")
+    qld.tables["QD2"].records[0]["__deleted__"] = True
+    pair = Dataset(qld)[0, 0]
+    assert pair.selection_status == "deleted"
+    assert pair.result is None
+    assert Dataset(qld)[0, 0].select_result(policy="first") is None
+    qld.tables["QD2"].records.clear()
+    pair = Dataset(qld)[0, 0]
+    assert pair.selection_status == "missing"
+    assert pair.result is None

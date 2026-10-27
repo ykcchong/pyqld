@@ -36,9 +36,18 @@ cli -> qld -> codec/dbf/ini
 The old root packages are not dependencies of `pyqld`. Do not copy fixes into
 them unless maintaining a historical experiment.
 
-Peak rows are indexed by `(sample_id, compound_name)`. Chromatograms are
+Peak rows are indexed by `(resolved_sample_index, compound_name)`. Resolve
+ownership from audited `Peaks/PeakList` row boundaries and raw-file identity;
+use sample ID only when unique. Never split result rows equally to infer
+ownership. Ambiguous labels must not collapse distinct injections.
+Chromatograms are
 indexed per sample by `(function, trace)`. Keep those indexes internal so the
 public record order remains identical to stream order.
+
+`validation.py` collects read-only diagnostics without changing tolerant
+loading. Numerical models and diagnostics live in `quantitation.py`; stored
+vendor calibration metadata remains in `domain.py`. Signal wrappers cache
+immutable NumPy arrays on first use and rebuild those caches after pickling.
 
 ## Tests
 

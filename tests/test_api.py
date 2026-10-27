@@ -26,7 +26,17 @@ def test_read_chromatograms_with_inconsistent_transition_spacing() -> None:
     assert len(dataset.compounds) == 18
     assert len(dataset.chromatograms) == 567
     for acquisition in dataset.acquisitions:
+        assert len(acquisition.functions) == acquisition.number_of_functions == 18
         assert len(acquisition.mrm_channels) == 27
+        function = acquisition.function(8)
+        assert float(function.start_time) == 9.2
+        assert float(function.end_time) == 11.7
+        channel = function.channel(2)
+        assert channel.compound_name == "HexNAc-OS"
+        assert float(channel.dwell_time) == 0.036
+        assert float(channel.cone_voltage) == 90
+        assert channel.delay == "Auto"
+        assert acquisition.channels_for(function=8, transition="771.3>568.4") == (channel,)
         for name, function, transition in [
             ("Sialyl-OS", 18, "1200.4>1099.4"),
             ("HexNAc-OS", 8, "771.3>568.4"),

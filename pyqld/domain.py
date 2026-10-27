@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from functools import cached_property, lru_cache
@@ -139,7 +139,7 @@ class CalibrationPoint:
 
 @dataclass(frozen=True)
 class CalibrationCurve:
-    """Calibration configuration and active points for one compound."""
+    """Stored calibration configuration and declared points for one compound."""
 
     compound_name: str
     model: str
@@ -183,12 +183,14 @@ _DECIMAL_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
 _MRM_TRANSITION = re.compile(rf"\s*({_DECIMAL_NUMBER})\s*>\s*({_DECIMAL_NUMBER})\s*")
 _FUNCTION_HEADING = re.compile(r"Function\s+([0-9]+)")
 _MRM_FUNCTION = re.compile(r"MRM of ([0-9]+) channels?")
+_FUNCTION_WINDOW = re.compile(rf"({_DECIMAL_NUMBER})\s+to\s+({_DECIMAL_NUMBER})")
 _CHANNEL_HEADING = re.compile(
     r"Chan\s+Reaction\s+Dwell\(secs\)\s+Cone\s+Volt\.\s+Col\.Energy\s+Delay\(secs\)(?:\s+.*)?"
 )
 _CHANNEL_ROW = re.compile(
     rf"([0-9]+)\s*:\s*({_DECIMAL_NUMBER}\s*>\s*{_DECIMAL_NUMBER})"
-    rf"\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})(?:\s+.*)?"
+    rf"\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})\s+({_DECIMAL_NUMBER})"
+    r"(?:\s+(\S+)(?:\s+(.*))?)?"
 )
 
 
@@ -224,64 +226,133 @@ class AcquisitionChannel:
     transition: MRMTransition
     ionization_mode: str
     collision_energy: Decimal
+    dwell_time: Decimal | None = None
+    cone_voltage: Decimal | None = None
+    delay: str = ""
+    compound_name: str = ""
 
 
-def _parse_mrm_channels(text: str) -> tuple[AcquisitionChannel, ...]:
-    lines = [line.strip() for line in text.splitlines()]
+@dataclass(frozen=True)
+class AcquisitionFunction:
+    """One reported function; function/channel numbers are vendor numbers, not indexes.
+
+    Times are minutes. Non-MRM functions retain their type and text but expose
+    no MRM channels. Raw text preserves settings without a typed interpretation.
+    """
+
+    number: int
+    function_type: str
+    ionization_mode: str
+    text: str = field(repr=False)
+
+    def _value(self, key: str) -> str:
+        return next(
+            (line.partition(":")[2].strip() for line in self.text.splitlines()
+             if line.strip().startswith(f"{key}:")),
+            "",
+        )
+
+    @cached_property
+    def _time_window(self) -> tuple[Decimal, Decimal] | None:
+        match = _FUNCTION_WINDOW.fullmatch(self._value("Start and End Time(mins)"))
+        return (Decimal(match[1]), Decimal(match[2])) if match is not None else None
+
+    @property
+    def start_time(self) -> Decimal | None:
+        """Reported start time in minutes, or None if absent/unrecognized."""
+        return self._time_window[0] if self._time_window is not None else None
+
+    @property
+    def end_time(self) -> Decimal | None:
+        """Reported end time in minutes, or None if absent/unrecognized."""
+        return self._time_window[1] if self._time_window is not None else None
+
+    @cached_property
+    def mrm_channels(self) -> tuple[AcquisitionChannel, ...]:
+        """Recognized MRM channels; malformed/unsupported MRM tables raise ValueError."""
+        if not self.function_type.startswith("MRM"):
+            return ()
+        lines = [line.strip() for line in self.text.splitlines()]
+        declared = _MRM_FUNCTION.fullmatch(self.function_type)
+        if declared is None or not any(_CHANNEL_HEADING.fullmatch(line) for line in lines):
+            raise ValueError(f"unsupported MRM acquisition table for function {self.number}")
+        channels = []
+        for line in lines:
+            if re.match(r"[0-9]+\s*:", line) is None:
+                continue
+            row = _CHANNEL_ROW.fullmatch(line)
+            if row is None:
+                raise ValueError(f"invalid MRM channel in function {self.number}: {line!r}")
+            transition = MRMTransition.parse(row.group(2))
+            if transition is None:
+                raise ValueError(f"invalid MRM transition in function {self.number}: {line!r}")
+            channels.append(AcquisitionChannel(
+                function=self.number,
+                number=int(row.group(1)),
+                transition=transition,
+                ionization_mode=self.ionization_mode,
+                collision_energy=Decimal(row.group(5)),
+                dwell_time=Decimal(row.group(3)),
+                cone_voltage=Decimal(row.group(4)),
+                delay=row.group(6) or "",
+                compound_name=row.group(7) or "",
+            ))
+        count = int(declared.group(1))
+        if (
+            count < 1
+            or len(channels) != count
+            or {channel.number for channel in channels} != set(range(1, count + 1))
+        ):
+            raise ValueError(f"incomplete or duplicate MRM channels in function {self.number}")
+        return tuple(channels)
+
+    def channel(self, number: int) -> AcquisitionChannel:
+        """Look up an MRM channel by vendor number; raise KeyError if absent."""
+        for channel in self.mrm_channels:
+            if channel.number == number:
+                return channel
+        raise KeyError(number)
+
+
+def _parse_functions(text: str) -> tuple[AcquisitionFunction, ...]:
+    lines = text.splitlines(keepends=True)
     headings = [
         (index, int(match.group(1)))
         for index, line in enumerate(lines)
-        if (match := _FUNCTION_HEADING.fullmatch(line)) is not None
+        if (match := _FUNCTION_HEADING.fullmatch(line.strip())) is not None
     ]
-    channels: list[AcquisitionChannel] = []
+    functions = []
     seen_functions: set[int] = set()
     for position, (start, function) in enumerate(headings):
         end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
-        block = lines[start + 1 : end]
+        # Do not interpret rows from later report sections as channel rows.
+        end = next(
+            (index for index in range(start + 1, end)
+             if _REPORT_SECTION.fullmatch(lines[index].strip())),
+            end,
+        )
+        block = [line.strip() for line in lines[start + 1 : end]]
         function_type = next(
             (line.partition(":")[2].strip() for line in block
              if line.startswith("Function type:")),
             "",
         )
-        if not function_type.startswith("MRM"):
-            continue
-        declared = _MRM_FUNCTION.fullmatch(function_type)
-        if declared is None or not any(_CHANNEL_HEADING.fullmatch(line) for line in block):
-            raise ValueError(f"unsupported MRM acquisition table for function {function}")
         if function in seen_functions:
-            raise ValueError(f"duplicate MRM acquisition table for function {function}")
+            kind = "MRM acquisition table" if function_type.startswith("MRM") else "function"
+            raise ValueError(f"duplicate {kind} for function {function}")
         seen_functions.add(function)
         mode = next(
             (line.partition(":")[2].strip() for line in block
              if line.startswith("Ionization mode:")),
             "",
         )
-        function_channels = []
-        for line in block:
-            if re.match(r"[0-9]+\s*:", line) is None:
-                continue
-            row = _CHANNEL_ROW.fullmatch(line)
-            if row is None:
-                raise ValueError(f"invalid MRM channel in function {function}: {line!r}")
-            transition = MRMTransition.parse(row.group(2))
-            if transition is None:
-                raise ValueError(f"invalid MRM transition in function {function}: {line!r}")
-            function_channels.append(AcquisitionChannel(
-                function=function,
-                number=int(row.group(1)),
-                transition=transition,
-                ionization_mode=mode,
-                collision_energy=Decimal(row.group(5)),
-            ))
-        count = int(declared.group(1))
-        if (
-            count < 1
-            or len(function_channels) != count
-            or {channel.number for channel in function_channels} != set(range(1, count + 1))
-        ):
-            raise ValueError(f"incomplete or duplicate MRM channels in function {function}")
-        channels.extend(function_channels)
-    return tuple(channels)
+        functions.append(AcquisitionFunction(
+            number=function,
+            function_type=function_type,
+            ionization_mode=mode,
+            text="".join(lines[start:end]),
+        ))
+    return tuple(functions)
 
 
 class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
@@ -328,10 +399,46 @@ class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
     def __reduce__(self) -> tuple[type[AcquisitionReport], tuple[str]]:
         return type(self), (self.text,)
 
+    def __repr__(self) -> str:
+        return f"<AcquisitionReport sections={len(self)} text_length={len(self.text)}>"
+
+    @cached_property
+    def functions(self) -> tuple[AcquisitionFunction, ...]:
+        """Reported functions in report order, including non-MRM function types."""
+        return _parse_functions(self.text)
+
+    def function(self, number: int) -> AcquisitionFunction:
+        """Look up a function by vendor number; raise KeyError if absent."""
+        for function in self.functions:
+            if function.number == number:
+                return function
+        raise KeyError(number)
+
     @cached_property
     def mrm_channels(self) -> tuple[AcquisitionChannel, ...]:
         """Recognized acquisition channels; malformed MRM tables raise ValueError."""
-        return _parse_mrm_channels(self.text)
+        return tuple(
+            channel for function in self.functions for channel in function.mrm_channels
+        )
+
+    def channels_for(
+        self, *, function: int | None = None, transition: MRMTransition | str | None = None,
+    ) -> tuple[AcquisitionChannel, ...]:
+        """Filter MRM channels by function and/or exact numeric transition.
+
+        All matches are retained, including duplicate mass pairs. Non-MRM
+        transition labels raise ValueError. Malformed MRM tables also raise.
+        """
+        if isinstance(transition, str):
+            parsed = MRMTransition.parse(transition)
+            if parsed is None:
+                raise ValueError(f"not a numeric MRM transition: {transition!r}")
+            transition = parsed
+        return tuple(
+            channel for channel in self.mrm_channels
+            if (function is None or channel.function == function)
+            and (transition is None or channel.transition == transition)
+        )
 
     def __getitem__(self, key: str) -> Mapping[str, ReportValue]:
         return self._sections[key]
@@ -343,7 +450,7 @@ class AcquisitionReport(Mapping[str, Mapping[str, ReportValue]]):
         return len(self._sections)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class AcquisitionInfo:
     """Acquisition metadata and reports for one sample."""
 
@@ -352,6 +459,26 @@ class AcquisitionInfo:
     number_of_functions: int
     report: AcquisitionReport
     header_bytes: bytes
+
+    def __repr__(self) -> str:
+        return (
+            f"<AcquisitionInfo index={self.index} sample_id={self.sample_id!r} "
+            f"instrument={self.instrument!r} functions={self.number_of_functions}>"
+        )
+
+    @property
+    def functions(self) -> tuple[AcquisitionFunction, ...]:
+        return self.report.functions
+
+    def function(self, number: int) -> AcquisitionFunction:
+        """Look up a function by vendor number; raise KeyError if absent."""
+        return self.report.function(number)
+
+    def channels_for(
+        self, *, function: int | None = None, transition: MRMTransition | str | None = None,
+    ) -> tuple[AcquisitionChannel, ...]:
+        """Filter reported MRM channels; see AcquisitionReport.channels_for."""
+        return self.report.channels_for(function=function, transition=transition)
 
     @property
     def mrm_channels(self) -> tuple[AcquisitionChannel, ...]:

@@ -28,7 +28,7 @@ cd pyqld
 python -m pip wheel . --no-deps --wheel-dir dist
 ```
 
-Requires Python 3.10+ and the `olefile` package (installed automatically).
+Requires Python 3.10+, `olefile` and NumPy (installed automatically).
 
 Installation also attempts to build small C extensions that accelerate LZSS
 decoding (combined with XOR decryption) and DBF cell conversion. Source builds
@@ -74,6 +74,23 @@ n_detected = sum(1 for p in ds.pairs() if p.area and p.area > 0)
 The entire file is decoded eagerly. The returned object does not hold an open
 file handle and does not require a context manager.
 
+Sample labels may repeat across injections: use a unique file name or index
+when lookup by ID is ambiguous. Result convenience properties require a unique
+active primary; use `pair.selection_status` and `pair.select_result(...)` for
+explicit selection. See [result selection](docs/api.md#result-selection).
+
+```python
+report = ds.validate()
+report.raise_for_errors()
+
+for trace in ds.chromatograms_for(sample, function=compound.function):
+    times, intensities = trace.to_numpy()  # cached read-only NumPy arrays
+    window_times, window_values = trace.time_window(1.0, 1.5)  # minutes
+```
+
+For explicit calibration fitting, reintegration and requantitation, see
+[numerical workflows](docs/usage.md#fit-and-apply-an-explicit-calibration).
+
 ## Edit A Copy
 
 ```python
@@ -115,6 +132,22 @@ pyqld datafile.qld --out-dir exported --split-sections --indent 2
 * **`Dataset.pairs()`** — iterate all (sample, compound) pairs
 * **`Dataset.acquisition(sample)`** — parsed acquisition metadata
 * **`Dataset.method`** — calibrations, method compounds, and audit events
+
+Acquisitions expose numbered functions and MRM channels directly:
+
+```python
+acquisition = ds.acquisition(sample)
+if acquisition is not None:
+    for function in acquisition.functions:
+        print(function.number, function.start_time, function.end_time)  # minutes
+        for channel in function.mrm_channels:
+            print(channel.transition, channel.dwell_time, channel.collision_energy)
+```
+
+Use `acquisition.function(number).channel(number)` for vendor-number lookup or
+`acquisition.channels_for(function=..., transition="568.2>347.2")` to filter.
+The typed API covers recognized MRM reports; other settings remain available in
+the preserved report. See [acquisition coverage and examples](docs/usage.md#acquisition-metadata).
 
 ### `CompoundResult`
 

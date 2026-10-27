@@ -69,6 +69,7 @@ from .codec import XOR_KEY, decode_quan_stream, decrypt, lzss_decode
 from .dbf import DBFTable, parse_dbf
 from .domain import (
     AcquisitionChannel,
+    AcquisitionFunction,
     AcquisitionInfo,
     AcquisitionReport,
     AuditEvent,
@@ -93,7 +94,13 @@ from .model import (
     Spectrum,
 )
 from .qld import QLDFile, export_dir, export_json, open_qld, to_json
-from .quantitation import LinearCalibration, PeakIntegration, integrate_peak
+from .quantitation import (
+    CalibrationDiagnostics,
+    LinearCalibration,
+    PeakIntegration,
+    integrate_peak,
+)
+from .validation import ValidationIssue, ValidationReport
 
 
 def read(path: str | Path) -> Dataset:
@@ -123,11 +130,15 @@ __all__ = [
     "AcquisitionReport",
     "AcquisitionInfo",
     "AcquisitionChannel",
+    "AcquisitionFunction",
     "MRMTransition",
     "AuditEvent",
     "LinearCalibration",
+    "CalibrationDiagnostics",
     "PeakIntegration",
     "integrate_peak",
+    "ValidationIssue",
+    "ValidationReport",
     # High-level I/O
     "read",
     "QLDFile",

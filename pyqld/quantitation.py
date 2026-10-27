@@ -4,13 +4,34 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 if TYPE_CHECKING:
+    from .domain import CalibrationCurve
     from .model import Compound, Dataset, QuantitationResult, Sample
+
+
+@dataclass(frozen=True)
+class CalibrationDiagnostics:
+    """Unweighted residual diagnostics for an explicitly fitted linear model.
+
+    A weighted fit still reports ordinary R² and response-unit RMSE. These
+    summarize the selected standards and do not constitute vendor QC flags.
+    """
+
+    number_of_points: int
+    weighting: str
+    r_squared: float | None
+    rmse: float
+    residuals: tuple[float, ...]
+    predicted_responses: tuple[float, ...]
+    back_calculated_concentrations: tuple[float, ...]
+    relative_errors: tuple[float | None, ...]
+    concentration_range: tuple[float, float]
+    point_indexes: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -21,6 +42,7 @@ class LinearCalibration:
     intercept: float = 0.0
     concentration_factor: float = 1.0
     response: str = "area"
+    diagnostics: CalibrationDiagnostics | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if not all(
@@ -44,6 +66,41 @@ class LinearCalibration:
         if not math.isfinite(value):
             raise ValueError("calculated concentration is not finite")
         return value
+
+    def predict_response(self, concentration: float) -> float:
+        """Predict response at an unscaled standard concentration (before the factor)."""
+        if not math.isfinite(concentration) or concentration < 0:
+            raise ValueError("standard concentration must be finite and nonnegative")
+        value = self.slope * concentration + self.intercept
+        if not math.isfinite(value):
+            raise ValueError("predicted response is not finite")
+        return value
+
+    @classmethod
+    def from_curve(
+        cls, curve: CalibrationCurve, *, point_indexes: Sequence[int],
+        weighting: str = "none", concentration_factor: float = 1.0, response: str = "area",
+    ) -> LinearCalibration:
+        """Refit explicitly selected stored standards to a new linear model.
+
+        This does not interpret vendor coefficients, model/origin codes or
+        point-status codes. Select zero-based point indexes intentionally.
+        Unsupported vendor methods cannot be converted by guessing coefficients.
+        """
+        indexes = tuple(point_indexes)
+        if (
+            not indexes or any(type(index) is not int or not 0 <= index < len(curve.points)
+                   for index in indexes)
+            or len(set(indexes)) != len(indexes)
+        ):
+            raise ValueError("select distinct, in-range integer calibration point indexes")
+        points = [curve.points[index] for index in indexes]
+        model = cls.fit(
+            [point.concentration for point in points], [point.response for point in points],
+            weighting=weighting, concentration_factor=concentration_factor, response=response,
+        )
+        assert model.diagnostics is not None
+        return replace(model, diagnostics=replace(model.diagnostics, point_indexes=indexes))
 
     @classmethod
     def fit(
@@ -77,9 +134,33 @@ class LinearCalibration:
                 raise ValueError("weighted calibration needs positive concentrations")
             weights = 1 / (np.sqrt(levels) if weighting == "1/x" else levels)
         coefficients = np.polynomial.Polynomial.fit(levels, values, 1, w=weights).convert().coef
-        return cls(
+        model = cls(
             float(coefficients[1]), float(coefficients[0]), concentration_factor, response
         )
+        predicted = model.slope * levels + model.intercept
+        residuals = values - predicted
+        squared_error = float(np.sum(residuals ** 2))
+        total_variation = float(np.sum((values - np.mean(values)) ** 2))
+        back_calculated = (values - model.intercept) / model.slope
+        if (
+            not math.isfinite(squared_error) or not math.isfinite(total_variation)
+            or not np.all(np.isfinite(back_calculated))
+        ):
+            raise ValueError("calibration diagnostics are not finite")
+        diagnostics = CalibrationDiagnostics(
+            number_of_points=len(levels), weighting=weighting,
+            r_squared=1 - squared_error / total_variation if total_variation > 0 else None,
+            rmse=math.sqrt(squared_error / len(levels)),
+            residuals=tuple(float(value) for value in residuals),
+            predicted_responses=tuple(float(value) for value in predicted),
+            back_calculated_concentrations=tuple(float(value) for value in back_calculated),
+            relative_errors=tuple(
+                float((actual - expected) / expected * 100) if expected else None
+                for actual, expected in zip(back_calculated, levels, strict=True)
+            ),
+            concentration_range=(float(np.min(levels)), float(np.max(levels))),
+        )
+        return replace(model, diagnostics=diagnostics)
 
 
 @dataclass(frozen=True)
@@ -247,6 +328,14 @@ def requantitate(
         ]
     if not selected:
         raise ValueError("no eligible results selected")
+    for result in selected:
+        if dataset.result_sample(result) is None:
+            raise ValueError(f"row {result.index}: unresolved result ownership")
+    if result_indexes is None:
+        identities = [(dataset._result_sample_indexes[row.index], row.compound_name)
+                      for row in selected]
+        if len(set(identities)) != len(identities):
+            raise ValueError("ambiguous primary results; select explicit result_indexes")
     changes = {
         result.index: _calculated_values(dataset, result, calibration) for result in selected
     }
@@ -271,7 +360,10 @@ def edit_peak(
         or dataset.results[result.index] is not result
     ):
         raise ValueError("result belongs to a different dataset")
-    pair = dataset[result.sample_id, result.compound_name]
+    sample = dataset.result_sample(result)
+    if sample is None:
+        raise ValueError(f"row {result.index}: unresolved result ownership")
+    pair = dataset[sample, result.compound_name]
     matches = [
         trace
         for trace in pair.chromatograms

@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from pyqld import Dataset, QLDFile, read
+from pyqld import (
+    CalibrationCurve,
+    CalibrationDiagnostics,
+    CalibrationPoint,
+    Dataset,
+    QLDFile,
+    read,
+)
 from pyqld.dbf import DBFTable, parse_dbf
 from pyqld.ini import IniBlob, IniSection
 from pyqld.quantitation import LinearCalibration, integrate_peak
@@ -66,6 +73,54 @@ def test_invalid_calibrations_rejected() -> None:
         LinearCalibration.fit([0, 1], [0, 2], weighting="1/x")
     with pytest.raises(ValueError):
         LinearCalibration.fit([1, 1], [2, 3])
+
+
+def test_fit_diagnostics_match_analytical_residuals() -> None:
+    calibration = LinearCalibration.fit([0, 1, 2], [1, 2, 5], concentration_factor=5)
+    diagnostics = calibration.diagnostics
+    assert isinstance(diagnostics, CalibrationDiagnostics)
+    assert diagnostics.number_of_points == 3
+    assert diagnostics.r_squared == pytest.approx(12 / 13)
+    assert diagnostics.rmse == pytest.approx(2 ** 0.5 / 3)
+    assert diagnostics.residuals == pytest.approx([1 / 3, -2 / 3, 1 / 3])
+    assert diagnostics.back_calculated_concentrations == pytest.approx([1 / 6, 2 / 3, 13 / 6])
+    assert diagnostics.relative_errors[0] is None
+    assert diagnostics.relative_errors[1:] == pytest.approx([-100 / 3, 100 / 12])
+    assert diagnostics.concentration_range == (0, 2)
+    assert calibration.predict_response(3) == pytest.approx(6 + 2 / 3)
+    assert calibration.concentration(calibration.predict_response(3)) == pytest.approx(15)
+    assert LinearCalibration(2).diagnostics is None
+    with pytest.raises(ValueError, match="nonnegative"):
+        calibration.predict_response(-1)
+
+
+@pytest.mark.parametrize("weighting", ["none", "1/x", "1/x^2"])
+def test_stored_curve_refit_requires_explicit_point_selection(weighting) -> None:
+    curve = CalibrationCurve("A", "vendor-unknown", "unknown", "unknown", False, (99,), (
+        CalibrationPoint(1, 12, 100, 7), CalibrationPoint(2, 9999, 100, 9),
+        CalibrationPoint(3, 32, 100, 7),
+    ))
+    calibration = LinearCalibration.from_curve(curve, point_indexes=[0, 2], weighting=weighting)
+    assert calibration.slope == pytest.approx(10)
+    assert calibration.intercept == pytest.approx(2)
+    assert calibration.diagnostics.point_indexes == (0, 2)
+    assert calibration.diagnostics.weighting == weighting
+    assert calibration.diagnostics.rmse == pytest.approx(0, abs=1e-12)
+    for indexes in ([], [0], [0, 0], [-1, 2], [0, 99], [True, 2], [[0], 2]):
+        with pytest.raises(ValueError):
+            LinearCalibration.from_curve(curve, point_indexes=indexes)
+
+
+def test_requantitation_rejects_ambiguous_default_selection() -> None:
+    from .test_model import _repeated_samples
+
+    qld = _repeated_samples().qld
+    qld.tables["QD2"].records.append(dict(qld.tables["QD2"].records[0]))
+    with pytest.raises(ValueError, match="ambiguous primary"):
+        Dataset(qld).requantitate(LinearCalibration(1))
+    unresolved = _repeated_samples(raw_names=False)
+    with pytest.raises(ValueError, match="unresolved result ownership"):
+        unresolved.requantitate(LinearCalibration(1))
 
 
 def test_batch_edit_is_atomic() -> None:
@@ -162,3 +217,31 @@ def test_real_peak_quantitation_export_and_reopen(tmp_path) -> None:
     with pytest.raises(ValueError, match="external-standard"):
         unsupported.requantitate(calibration, compound=0)
     assert unsupported[1, 0].result.concentration == original[1, 0].result.concentration
+
+
+def test_repeated_injection_processing_and_reopen_preserve_ownership(tmp_path) -> None:
+    fixture = Path(__file__).parents[1] / "data" / "UOS 20261013 BEH Amide PS.qld"
+    if not fixture.exists():
+        pytest.skip("repository fixture unavailable")
+    original = read(fixture)
+    result = original[18, 0].result
+    first_area = original[1, 0].area
+    edited = original.edit_peak(
+        result, result.get("start_rt"), result.get("end_rt"), LinearCalibration(1000),
+        area_scale=60,
+    )
+    assert edited[1, 0].area == first_area
+    assert edited[18, 0].area > 0
+    assert edited.result_sample(edited.results[result.index]).index == 18
+    updated = edited.requantitate(LinearCalibration(2000), sample=18, compound=0)
+    assert updated[18, 0].result.concentration == pytest.approx(updated[18, 0].area / 2000)
+    assert updated[1, 0].result.concentration == original[1, 0].result.concentration
+    rows = updated.compound_results(sample=18, compound=0)
+    assert {row["sample_index"] for row in rows} == {18}
+    assert {row["file_name"] for row in rows} == {"MS26101319"}
+    reopened = read(updated.save(tmp_path / "repeated-injection.qld"))
+    assert reopened[18, 0].result.index == 3244
+    assert reopened[18, 0].area == updated[18, 0].area
+    assert reopened[1, 0].area == first_area
+    assert reopened.qld.streams["QD5"] == original.qld.streams["QD5"]
+    assert reopened.validate().is_valid

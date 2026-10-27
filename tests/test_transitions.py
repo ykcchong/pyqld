@@ -1,10 +1,18 @@
 """Exact MRM identities and independently reported acquisition channels."""
 
+from dataclasses import FrozenInstanceError
 from decimal import Decimal, localcontext
 
 import pytest
 
-from pyqld import AcquisitionReport, Dataset, MRMTransition, QLDFile
+from pyqld import (
+    AcquisitionChannel,
+    AcquisitionFunction,
+    AcquisitionReport,
+    Dataset,
+    MRMTransition,
+    QLDFile,
+)
 from pyqld.dbf import DBFTable
 from pyqld.ini import IniBlob, IniSection
 
@@ -99,6 +107,104 @@ def test_acquisition_report_parses_channels_without_assigning_roles() -> None:
     assert pair.qualifier_chromatogram is dataset.chromatograms[0]
     assert pair.chromatograms == [dataset.chromatograms[1], dataset.chromatograms[0]]
     assert dataset.acquisitions[0].mrm_channels == channels
+
+
+def test_acquisition_function_navigation_preserves_function_settings() -> None:
+    text = (REPORT + REPORT.replace("Function 3", "Function 8")).replace("\n", "\r\n")
+    acquisition = _dataset(text).acquisition(0)
+    functions = acquisition.functions
+    assert functions is acquisition.functions
+    assert [function.number for function in functions] == [3, 8]
+    function = acquisition.function(3)
+    assert isinstance(function, AcquisitionFunction)
+    assert function is functions[0]
+    assert function.function_type == "MRM of 2 channels"
+    assert function.ionization_mode == "ES-"
+    assert function.start_time == Decimal("1.000")
+    assert function.end_time == Decimal("2.000")
+    assert function.text.startswith("Function 3\r\n")
+    assert "Function 8" not in function.text
+    assert function.channel(2) is acquisition.channels_for(function=3)[1]
+    assert function.mrm_channels == acquisition.mrm_channels[:2]
+    assert "Reaction" not in repr(function)
+    with pytest.raises(FrozenInstanceError):
+        function.number = 4
+    with pytest.raises(FrozenInstanceError):
+        function.channel(1).dwell_time = Decimal("1")
+    with pytest.raises(KeyError):
+        acquisition.function(0)  # vendor function number, not tuple index
+    with pytest.raises(KeyError):
+        function.channel(0)
+
+
+def test_acquisition_channels_expose_remaining_report_columns() -> None:
+    report = AcquisitionReport(REPORT.replace("Auto Analyte", "0.005 Analyte with spaces"))
+    channel = report.function(3).channel(1)
+    assert channel.dwell_time == Decimal("0.036")
+    assert channel.cone_voltage == Decimal("75.0")
+    assert channel.collision_energy == Decimal("60.0")
+    assert channel.delay == "0.005"
+    assert channel.compound_name == "Analyte with spaces"
+    assert AcquisitionReport(REPORT).function(3).channel(1).delay == "Auto"
+
+
+def test_acquisition_channel_optional_columns_and_constructor_compatibility() -> None:
+    report = AcquisitionReport(REPORT.replace(" Auto Analyte", ""))
+    channel = report.function(3).channel(1)
+    assert channel.delay == channel.compound_name == ""
+    original = AcquisitionChannel(3, 1, channel.transition, "ES-", Decimal("60"))
+    assert original.dwell_time is original.cone_voltage is None
+    assert original.delay == original.compound_name == ""
+
+
+def test_channel_filter_retains_duplicate_transitions_and_scopes_function() -> None:
+    duplicate = REPORT.replace("100.00 > 25.00", "100.00 > 50.00")
+    report = duplicate + REPORT.replace("Function 3", "Function 8")
+    acquisition = _dataset(report).acquisition(0)
+    assert len(acquisition.channels_for(transition=" 1e2 > 50.00 ")) == 3
+    assert len(acquisition.channels_for(function=3, transition="100>50")) == 2
+    transition = MRMTransition.parse("100>50")
+    assert acquisition.channels_for(function=8, transition=transition) == (
+        acquisition.function(8).channel(2),
+    )
+    assert acquisition.channels_for() == acquisition.mrm_channels
+    assert acquisition.channels_for(function=7) == ()
+    assert acquisition.channels_for(transition="100>51") == ()
+    with pytest.raises(ValueError, match="not a numeric MRM transition"):
+        acquisition.channels_for(transition="TIC")
+
+
+def test_non_mrm_functions_keep_metadata_without_claiming_mrm_channels() -> None:
+    text = "Function 9\nIonization mode: ES+\nFunction type: Scan\nMass range: 50 to 500\n"
+    report = AcquisitionReport(text)
+    function = report.function(9)
+    assert function.function_type == "Scan"
+    assert function.text == text
+    assert function.ionization_mode == "ES+"
+    assert function.start_time is function.end_time is None
+    assert function.mrm_channels == report.mrm_channels == ()
+    with pytest.raises(KeyError):
+        function.channel(1)
+
+
+def test_duplicate_non_mrm_function_numbers_are_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicate function"):
+        _ = AcquisitionReport("Function 1\nFunction type: Scan\n" * 2).functions
+
+
+def test_function_channel_table_does_not_consume_later_report_sections() -> None:
+    report = AcquisitionReport(REPORT + "-- Other section --\n1: unrelated data\n")
+    assert len(report.mrm_channels) == 2
+    assert "unrelated" not in report.function(3).text
+
+
+def test_malformed_mrm_function_can_be_inspected_before_channel_parsing() -> None:
+    report = AcquisitionReport(REPORT.replace("MRM of 2 channels", "MRM unknown"))
+    assert report.function(3).function_type == "MRM unknown"
+    with pytest.raises(ValueError, match="unsupported"):
+        report.channels_for(function=3)
+    with pytest.raises(ValueError, match="unsupported"):
+        report.function(3).channel(1)
 
 
 @pytest.mark.parametrize("report", [None, "", "-- HEADER --\nInstrument: MS\n"])

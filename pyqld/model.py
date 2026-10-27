@@ -27,6 +27,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
+import numpy as np
+from numpy.typing import NDArray
+
 from .dbf import DBFTable
 from .domain import (
     AcquisitionInfo,
@@ -39,6 +42,7 @@ from .domain import (
 from .ini import IniBlob, IniSection
 from .qld import QLDFile, open_qld
 from .quantitation import LinearCalibration
+from .validation import ValidationReport, validate_dataset
 
 
 @lru_cache(maxsize=4096)
@@ -253,6 +257,11 @@ class QuantitationResult(_Record):
         return str(self._data.get("SAMPLE_ID", ""))
 
     @property
+    def raw_file_name(self) -> str:
+        """Raw injection file named by this result, when present."""
+        return str(self._data.get("RAW_NAME") or "")
+
+    @property
     def compound_name(self) -> str:
         return str(self._data.get("NAME", ""))
 
@@ -293,7 +302,16 @@ class QuantitationResult(_Record):
 
     @property
     def is_primary(self) -> bool:
-        return int(self._data.get("METH_PEAK", 0) or 0) == 0
+        value = self._data.get("METH_PEAK")
+        try:
+            return value not in (None, "") and float(value) == 0
+        except (TypeError, ValueError):
+            return False
+
+    @property
+    def is_deleted(self) -> bool:
+        """Whether the result or its underlying DBF row is marked deleted."""
+        return bool(self.get("deleted_pk") or self.get("__deleted__"))
 
     @property
     def response(self) -> float | None:
@@ -371,7 +389,48 @@ def _float(section: IniSection, key: str, default: float = 0.0) -> float:
 # ---------------------------------------------------------------------------
 
 
-class Chromatogram:
+class _Signal:
+    """Immutable cached arrays shared by the two signal wrappers."""
+
+    __slots__ = ("_array_cache",)
+
+    _array_cache: tuple[NDArray[np.float64], NDArray[np.float64]] | None
+
+    def _coordinates(self) -> list[float]:
+        raise NotImplementedError
+
+    @property
+    def intensities(self) -> list[float]:
+        raise NotImplementedError
+
+    def to_numpy(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return cached read-only coordinate/intensity arrays, without copying.
+
+        The first access builds the arrays. Existing list properties still
+        return independent copies. Malformed/nonfinite signals raise ValueError.
+        """
+        if self._array_cache is None:
+            x, y = self._coordinates(), self.intensities
+            if len(x) != len(y):
+                raise ValueError(f"signal array lengths differ: {len(x)} and {len(y)}")
+            if not all(np.isfinite(x)) or not all(np.isfinite(y)):
+                raise ValueError("signal arrays contain nonfinite values")
+            # Immutable bytes prevent callers from re-enabling write access.
+            arrays = [
+                np.frombuffer(np.asarray(values, dtype=np.float64).tobytes(), dtype=np.float64)
+                for values in (x, y)
+            ]
+            self._array_cache = (arrays[0], arrays[1])
+        return self._array_cache
+
+    def __iter__(self) -> Iterator[tuple[float, float]]:
+        return iter(zip(*self.to_numpy(), strict=True))
+
+    def __len__(self) -> int:
+        return len(self.to_numpy()[0])
+
+
+class Chromatogram(_Signal):
     """One ``[Chromatogram]`` section from ``QD5``."""
 
     __slots__ = ("_section", "index")
@@ -379,6 +438,10 @@ class Chromatogram:
     def __init__(self, section: IniSection, index: int) -> None:
         self._section = section
         self.index = index
+        self._array_cache = None
+
+    def __reduce__(self):
+        return type(self), (self._section, self.index)
 
     @property
     def section(self) -> IniSection:
@@ -440,11 +503,24 @@ class Chromatogram:
     def intensities(self) -> list[float]:
         return _floats_from_section(self._section, "Intensities")
 
-    def __iter__(self) -> Iterator[tuple[float, float]]:
-        return iter(zip(self.times, self.intensities, strict=False))
+    def _coordinates(self) -> list[float]:
+        return self.times
 
-    def __len__(self) -> int:
-        return min(len(self.times), len(self.intensities))
+    def time_window(
+        self, start: float, end: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return read-only views of stored points in inclusive [start, end] minutes.
+
+        No interpolation is applied. Windows outside the trace return empty
+        arrays; times must be strictly increasing.
+        """
+        if not np.isfinite(start) or not np.isfinite(end) or start > end:
+            raise ValueError("time window must have finite, ordered boundaries")
+        times, values = self.to_numpy()
+        if np.any(np.diff(times) <= 0):
+            raise ValueError("times must be strictly increasing")
+        low, high = np.searchsorted(times, start), np.searchsorted(times, end, side="right")
+        return times[low:high], values[low:high]
 
     def to_dict(self) -> dict[str, Any]:
         return self._section.to_dict()
@@ -456,7 +532,7 @@ class Chromatogram:
         )
 
 
-class Spectrum:
+class Spectrum(_Signal):
     """One ``[Spectrum]`` section from ``QD7``."""
 
     __slots__ = ("_section", "index")
@@ -464,6 +540,10 @@ class Spectrum:
     def __init__(self, section: IniSection, index: int) -> None:
         self._section = section
         self.index = index
+        self._array_cache = None
+
+    def __reduce__(self):
+        return type(self), (self._section, self.index)
 
     @property
     def section(self) -> IniSection:
@@ -493,11 +573,8 @@ class Spectrum:
     def intensities(self) -> list[float]:
         return _floats_from_section(self._section, "Intensities")
 
-    def __iter__(self) -> Iterator[tuple[float, float]]:
-        return iter(zip(self.masses, self.intensities, strict=False))
-
-    def __len__(self) -> int:
-        return min(len(self.masses), len(self.intensities))
+    def _coordinates(self) -> list[float]:
+        return self.masses
 
     def to_dict(self) -> dict[str, Any]:
         return self._section.to_dict()
@@ -526,11 +603,10 @@ class CompoundResult:
 
     @property
     def peaks(self) -> list[Peak]:
-        return list(
-            self.dataset._peaks_by_pair.get(
-                (self.sample.id, self.compound.name), []
-            )
-        )
+        self.dataset._check_result_ownership(self.sample)
+        return list(self.dataset._peaks_by_pair.get(
+            (self.sample.index, self.compound.name), []
+        ))
 
     @property
     def results(self) -> list[QuantitationResult]:
@@ -539,11 +615,54 @@ class CompoundResult:
 
     @property
     def primary_peak(self) -> Peak | None:
-        peaks = self.peaks
-        for p in peaks:
-            if p.is_primary:
-                return p
-        return peaks[0] if peaks else None
+        return self.select_result()
+
+    @property
+    def selection_status(self) -> str:
+        """One of missing, deleted, no_primary, ambiguous, or primary."""
+        rows = self.results
+        active = [row for row in rows if not row.is_deleted]
+        if not rows:
+            return "missing"
+        if not active:
+            return "deleted"
+        primaries = [row for row in active if row.is_primary]
+        if not primaries:
+            return "no_primary"
+        return "ambiguous" if len(primaries) > 1 else "primary"
+
+    def select_result(
+        self, *, policy: str = "primary", include_deleted: bool = False,
+    ) -> QuantitationResult | None:
+        """Select a result explicitly; defaults require a unique active primary.
+
+        No eligible rows returns None. Ambiguous primaries always raise except
+        with policy='first'. policy='primary_or_first' permits a first-row
+        fallback only when no primary exists. Missing primary markers are not
+        evidence of a primary result.
+        """
+        if policy not in {"primary", "first", "primary_or_first"}:
+            raise ValueError(
+                "result selection policy must be primary, first, or primary_or_first"
+            )
+        rows = [row for row in self.results if include_deleted or not row.is_deleted]
+        if not rows:
+            return None
+        if policy == "first":
+            return rows[0]
+        primaries = [row for row in rows if row.is_primary]
+        context = f"sample index {self.sample.index}, compound {self.compound.name!r}"
+        if len(primaries) > 1:
+            raise ValueError(
+                f"ambiguous primary results for {context}: rows {[r.index for r in primaries]}"
+            )
+        if primaries:
+            return primaries[0]
+        if policy == "primary_or_first":
+            return rows[0]
+        raise ValueError(
+            f"no primary result for {context}; choose an explicit selection policy"
+        )
 
     @property
     def primary_result(self) -> QuantitationResult | None:
@@ -627,9 +746,8 @@ class CompoundResult:
 
     def __repr__(self) -> str:
         return (
-            f"<CompoundResult sample={self.sample.id!r} "
-            f"compound={self.compound.name!r} area={self.area} "
-            f"rt={self.retention_time}>"
+            f"<CompoundResult sample_index={self.sample.index} sample={self.sample.id!r} "
+            f"compound={self.compound.name!r}>"
         )
 
 
@@ -798,17 +916,16 @@ class Dataset:
         self.method = Method(self)
 
         # Lookup indices
-        self._sample_by_id: dict[str, Sample] = {s.id: s for s in self.samples}
-        self._sample_by_file: dict[str, Sample] = {
-            s.file_name: s for s in self.samples
-        }
+        self._samples_by_key: dict[str, list[Sample]] = {}
+        for sample in self.samples:
+            for key in {sample.id, sample.file_name} - {""}:
+                self._samples_by_key.setdefault(key, []).append(sample)
         self._compound_by_name: dict[str, Compound] = {
             c.name: c for c in self.compounds
         }
-        self._peaks_by_pair: dict[tuple[str, str], list[Peak]] = {}
-        for peak in self.results:
-            key = (peak.sample_id, peak.compound_name)
-            self._peaks_by_pair.setdefault(key, []).append(peak)
+        self._peaks_by_pair: dict[tuple[int, str], list[Peak]] = {}
+        self._result_sample_indexes: list[int | None] = []
+        self._build_result_ownership()
 
         # Sample-owned media layouts
         self._chrom_index: list[
@@ -820,37 +937,98 @@ class Dataset:
 
     # ---------------------------------------------------- internal layout
 
+    def _build_result_ownership(self) -> None:
+        """Resolve injections using audited row boundaries and raw-file identity.
+
+        Result counts are never inferred by dividing rows equally among samples.
+        Labels alone are usable only when they identify exactly one sample.
+        """
+        sizes = self._sample_table_sizes("Peaks", "PeakList", len(self.results),
+                                         allow_even_split=False)
+        audited = [index for index, size in enumerate(sizes or []) for _ in range(size)]
+        by_id: dict[str, set[int]] = {}
+        by_file: dict[str, set[int]] = {}
+        for sample in self.samples:
+            by_id.setdefault(sample.id, set()).add(sample.index)
+            by_file.setdefault(sample.file_name, set()).add(sample.index)
+        self._unresolved_results_by_sample: dict[int, list[int]] = {}
+        for result in self.results:
+            labels = by_id.get(result.sample_id, set())
+            files = by_file.get(result.raw_file_name, set())
+            candidates = labels & files if result.sample_id and result.raw_file_name else (
+                labels if result.sample_id else files if result.raw_file_name else set()
+            )
+            if audited:
+                owner = audited[result.index]
+                # A conflicting explicit identity must not be overridden by row order.
+                resolved = owner if (
+                    not (result.sample_id or result.raw_file_name) or owner in candidates
+                ) else None
+            else:
+                resolved = next(iter(candidates)) if len(candidates) == 1 else None
+            self._result_sample_indexes.append(resolved)
+            if resolved is not None:
+                self._peaks_by_pair.setdefault(
+                    (resolved, result.compound_name), []
+                ).append(result)
+            else:
+                affected = labels | files if result.sample_id or result.raw_file_name else (
+                    set(range(len(self.samples)))
+                )
+                for index in affected:
+                    self._unresolved_results_by_sample.setdefault(index, []).append(
+                        result.index
+                    )
+
+    def _check_result_ownership(self, sample: Sample) -> None:
+        unresolved = self._unresolved_results_by_sample.get(sample.index, [])
+        if unresolved:
+            raise ValueError(
+                f"unresolved result ownership for sample index {sample.index}: "
+                f"rows {unresolved}"
+            )
+
     def _sample_table_sizes(
         self,
         top_level_name: str,
         child_name: str,
         total_items: int,
+        *,
+        allow_even_split: bool = True,
     ) -> list[int] | None:
         """Return validated per-sample table sizes from the audit stream."""
         n_samples = len(self.samples)
         if n_samples == 0:
             return [] if total_items == 0 else None
-        if total_items == 0:
-            return [0] * n_samples
-
         sizes: list[int | None] = [None] * n_samples
+        reported = False
         for top_level in self.method.audit:
             if top_level.name != top_level_name:
                 continue
             for key, value in top_level.items:
                 if key != child_name or not isinstance(value, IniSection):
                     continue
+                reported = True
                 table_index = _int(value, "TableID") - 1
                 table_size = _int(value, "TableSize", -1)
-                if 0 <= table_index < n_samples and table_size >= 0:
+                if (
+                    0 <= table_index < n_samples and table_size >= 0
+                    and sizes[table_index] is None
+                ):
                     sizes[table_index] = table_size
+                else:
+                    return None
 
         if all(size is not None for size in sizes):
             resolved = [int(size) for size in sizes if size is not None]
             if sum(resolved) == total_items:
                 return resolved
 
-        if total_items % n_samples == 0:
+        if reported:
+            return None
+        if total_items == 0:
+            return [0] * n_samples
+        if allow_even_split and not reported and total_items % n_samples == 0:
             return [total_items // n_samples] * n_samples
         return None
 
@@ -864,10 +1042,13 @@ class Dataset:
         chrom_sizes = self._sample_table_sizes(
             "Chromatograms", "SampleChromatograms", len(self.chromatograms)
         )
+        self._chrom_layout_resolved = chrom_sizes is not None
+        self._chromatograms_by_sample: list[list[Chromatogram]] = [[] for _ in range(n_samples)]
         if chrom_sizes is not None:
             offset = 0
             for sample_index, size in enumerate(chrom_sizes):
                 for ch in self.chromatograms[offset : offset + size]:
+                    self._chromatograms_by_sample[sample_index].append(ch)
                     key = (ch.function, _normalize_transition(ch.trace))
                     self._chrom_index[sample_index].setdefault(key, []).append(ch)
                 offset += size
@@ -875,6 +1056,7 @@ class Dataset:
         spectrum_sizes = self._sample_table_sizes(
             "Spectra", "SampleSpectra", len(self.spectra)
         )
+        self._spectra_layout_resolved = spectrum_sizes is not None
         if spectrum_sizes is not None:
             offset = 0
             for sample_index, size in enumerate(spectrum_sizes):
@@ -901,6 +1083,8 @@ class Dataset:
     def _chromatogram_for(
         self, sample: Sample, function: int, trace: str
     ) -> Chromatogram | None:
+        if not self._chrom_layout_resolved:
+            raise ValueError("unresolved chromatogram ownership; inspect dataset.validate()")
         if not self._chrom_index or not (
             0 <= sample.index < len(self._chrom_index)
         ):
@@ -918,10 +1102,7 @@ class Dataset:
             acquisition = self.acquisition(sample)
             if acquisition is not None:
                 try:
-                    channels = [
-                        channel for channel in acquisition.mrm_channels
-                        if channel.function == function
-                    ]
+                    channels = acquisition.channels_for(function=function)
                 except ValueError as e:
                     raise ValueError(f"invalid acquisition metadata for {context}: {e}") from e
                 if channels:
@@ -971,6 +1152,10 @@ class Dataset:
         """Save the current dataset as a QLD file without overwriting by default."""
         return self.qld.save(path, overwrite=overwrite)
 
+    def validate(self) -> ValidationReport:
+        """Inspect structural, identity and signal issues without changing data."""
+        return validate_dataset(self)
+
     def edit_peak(
         self, result: QuantitationResult, start: float, end: float,
         calibration: LinearCalibration, *, baseline: str = "linear", area_scale: float = 1.0,
@@ -998,6 +1183,8 @@ class Dataset:
         """Export all named result rows, retaining identifiers and peak multiplicity."""
         return [{
             "result_index": result.index, "sample_id": result.sample_id,
+            "sample_index": self._result_sample_indexes[result.index],
+            "file_name": result.raw_file_name,
             "compound": result.compound_name, "function": result.function,
             "transition": result.transition, "primary": result.is_primary,
             "deleted": bool(result.get("deleted_pk") or result.get("__deleted__")),
@@ -1040,17 +1227,25 @@ class Dataset:
             raise ValueError("sample belongs to a different dataset")
         if isinstance(key, int):
             return self.samples[key]
-        if key in self._sample_by_id:
-            return self._sample_by_id[key]
-        if key in self._sample_by_file:
-            return self._sample_by_file[key]
+        matches = self._samples_by_key.get(key, [])
+        if len(matches) > 1:
+            raise ValueError(
+                f"ambiguous sample {key!r}: indexes {[sample.index for sample in matches]}; "
+                "use a sample index or unique file name"
+            )
+        if matches:
+            return matches[0]
         raise KeyError(f"no sample with id/file_name {key!r}")
 
     def get_sample(self, key: int | str | Sample) -> Sample | None:
         try:
             return self.sample(key)
-        except (IndexError, KeyError, ValueError):
+        except (IndexError, KeyError):
             return None
+        except ValueError:
+            if isinstance(key, Sample):
+                return None
+            raise  # ambiguous string keys must not look like missing samples
 
     def compound(self, key: int | str | Compound) -> Compound:
         """Lookup a compound by index, name, or existing :class:`Compound`."""
@@ -1090,6 +1285,8 @@ class Dataset:
     ) -> list[Spectrum]:
         """Return spectra owned by a sample, optionally for one function."""
         resolved = self.sample(sample)
+        if not self._spectra_layout_resolved:
+            raise ValueError("unresolved spectrum ownership; inspect dataset.validate()")
         if not 0 <= resolved.index < len(self._spectra_by_sample):
             return []
         if function is not None:
@@ -1099,6 +1296,50 @@ class Dataset:
                 )
             )
         return list(self._spectra_by_sample[resolved.index])
+
+    def chromatograms_for(
+        self, sample: int | str | Sample, *, function: int | None = None,
+        transition: MRMTransition | str | None = None,
+    ) -> list[Chromatogram]:
+        """Filter stored traces in file order without requiring a compound.
+
+        All matching traces are retained for inspection, including duplicates.
+        Use chromatogram() for a unique, acquisition-checked lookup.
+        """
+        resolved = self.sample(sample)
+        if not self._chrom_layout_resolved:
+            raise ValueError("unresolved chromatogram ownership; inspect dataset.validate()")
+        target = (
+            _normalize_transition(transition) if isinstance(transition, str) else transition
+        )
+        return [trace for trace in self._chromatograms_by_sample[resolved.index]
+                if (function is None or trace.function == function)
+                and (target is None or _normalize_transition(trace.trace) == target)]
+
+    def chromatogram(
+        self, sample: int | str | Sample, *, function: int,
+        transition: MRMTransition | str,
+    ) -> Chromatogram | None:
+        """Return one acquisition-checked trace, None if absent, or raise on ambiguity."""
+        label = transition if isinstance(transition, str) else (
+            f"{transition.precursor_mz}>{transition.product_mz}"
+        )
+        return self._chromatogram_for(self.sample(sample), function, label)
+
+    def result_sample(self, result: QuantitationResult) -> Sample | None:
+        """Return the owning injection, or None when ownership is unresolved."""
+        if (
+            not 0 <= result.index < len(self.results)
+            or self.results[result.index] is not result
+        ):
+            raise ValueError("result belongs to a different dataset")
+        index = self._result_sample_indexes[result.index]
+        return self.samples[index] if index is not None else None
+
+    @property
+    def unresolved_results(self) -> list[QuantitationResult]:
+        """Raw result rows whose owning injection cannot be established safely."""
+        return [r for r in self.results if self._result_sample_indexes[r.index] is None]
 
     def results_for(
         self,
@@ -1110,7 +1351,9 @@ class Dataset:
         named: bool | None = None,
     ) -> list[QuantitationResult]:
         """Filter quantitation results using domain values."""
-        sample_id = self.sample(sample).id if sample is not None else None
+        resolved = self.sample(sample) if sample is not None else None
+        if resolved is not None:
+            self._check_result_ownership(resolved)
         compound_name = (
             self.compound(compound).name if compound is not None else None
         )
@@ -1121,7 +1364,7 @@ class Dataset:
         return [
             result
             for result in self.results
-            if (sample_id is None or result.sample_id == sample_id)
+            if (resolved is None or self._result_sample_indexes[result.index] == resolved.index)
             and (compound_name is None or result.compound_name == compound_name)
             and (function is None or result.function == function)
             and (
