@@ -6,7 +6,7 @@ Read Waters TargetLynx `.qld` quantitation files on any platform — no Windows,
 
 The `.qld` file is a proprietary binary container used by Waters TargetLynx to store quantitation results from LC-MS/MS analyses. It is a Microsoft OLE2 Compound Document whose substreams are LZSS-compressed and XOR "encrypted".
 
-`pyqld` fully decodes these files and exposes the data through:
+`pyqld` decodes the supported stream structures and exposes the data through:
 
 * A **high-level object model** with snake_case mappings, typed result quality,
   integration, acquisition, calibration, and audit values
@@ -29,6 +29,13 @@ python -m pip wheel . --no-deps --wheel-dir dist
 ```
 
 Requires Python 3.10+, `olefile` and NumPy (installed automatically).
+
+Optional interoperability extras are available as `pyqld[openms]` and
+`pyqld[matchms]`, subject to those engines' Python/platform support. Export
+retained MRM traces to pyOpenMS/mzML, explicitly described assays to TraML or
+Skyline CSV, and linked quantitation/provenance JSON without rewriting the QLD.
+Spectrum export requires externally verified metadata; it never reconstructs
+missing raw scans. See [MS interoperability](docs/usage.md#interoperate-with-ms-software).
 
 Installation also attempts to build small C extensions that accelerate LZSS
 decoding (combined with XOR decryption) and DBF cell conversion. Source builds
@@ -73,6 +80,12 @@ n_detected = sum(1 for p in ds.pairs() if p.area and p.area > 0)
 
 The entire file is decoded eagerly. The returned object does not hold an open
 file handle and does not require a context manager.
+
+For structural integrity checks while loading, use `pyqld.read(path, strict=True)`
+or the CLI's `--strict` flag. Default loading remains tolerant for recovery;
+inspect `dataset.validate()` before scientific use. Unknown binary payloads
+are preserved, not assigned guessed meanings. See
+[reader coverage and remaining gaps](docs/development.md#reader-coverage-and-remaining-gaps).
 
 Sample labels may repeat across injections: use a unique file name or index
 when lookup by ID is ambiguous. Result convenience properties require a unique

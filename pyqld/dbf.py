@@ -5,7 +5,8 @@ Layout (after decoding by :mod:`pyqld.codec`)::
     file header (32 bytes):
         u32  magic = 0x0B047E03
         u32  nrecs
-        u32  unknown (often 0)
+        u16  header length (record-data offset)
+        u16  record size (including deletion flag)
         20   reserved zeros
 
     field records (32 bytes each, repeated):
@@ -33,10 +34,15 @@ Logical fields hold ``'T'``/``'F'`` (or ``'1'``/``'0'``).
 from __future__ import annotations
 
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+_native_parse_records: Callable[
+    [bytes, int, int, int, list[tuple[str, int, int, str, int]]],
+    list[dict[str, Any]],
+] | None
 try:
     from ._dbf_native import parse_records as _native_parse_records
 except ImportError:
@@ -66,10 +72,13 @@ class DBFField:
     width: int
     decimals: int
     occurrence: int = 1
+    record_key: str | None = None
 
     @property
     def key(self) -> str:
         """Unique record key, with a suffix for repeated vendor names."""
+        if self.record_key is not None:
+            return self.record_key
         return self.name if self.occurrence == 1 else f"{self.name}_{self.occurrence}"
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,6 +92,8 @@ class DBFField:
 
     def encode(self, value: Any) -> bytes:
         """Encode an edited value without truncation or numeric rounding."""
+        if self.type not in _FIELD_TYPES:
+            raise ValueError(f"{self.key}: editing unsupported field type {self.type!r}")
         if self.type == "L":
             if not isinstance(value, bool):
                 raise ValueError(f"{self.key} requires a boolean")
@@ -117,14 +128,18 @@ class DBFTable:
     nrecs: int
     fields: list[DBFField]
     records: list[dict[str, Any]] = field(default_factory=list)
+    issues: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "kind": "dbf",
             "nrecs": self.nrecs,
             "fields": [f.to_dict() for f in self.fields],
             "records": self.records,
         }
+        if self.issues:
+            result["issues"] = list(self.issues)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +178,16 @@ def _decode_text_value(text: str, ftype: str, decimals: int) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def parse_dbf(data: bytes) -> DBFTable:
+def parse_dbf(data: bytes, *, strict: bool = False) -> DBFTable:
     """Parse a TargetLynx dBase-III variant table from ``data``.
 
     Parameters
     ----------
     data : bytes
         The decoded (plaintext) stream bytes.
+    strict : bool
+        Reject structural issues or unsupported field types instead of recovering
+        records and recording diagnostics in ``DBFTable.issues``.
 
     Returns
     -------
@@ -179,10 +197,12 @@ def parse_dbf(data: bytes) -> DBFTable:
     Raises
     ------
     ValueError
-        If the data does not start with the dBase magic prefix.
+        For invalid/short headers, or reported structural issues in strict mode.
     """
     if not is_dbf(data):
         raise ValueError(f"not a dBase table: magic={data[:4].hex()}")
+    if len(data) < 32:
+        raise ValueError("truncated dBase header: expected at least 32 bytes")
 
     nrecs = struct.unpack_from("<I", data, 4)[0]
 
@@ -192,17 +212,22 @@ def parse_dbf(data: bytes) -> DBFTable:
 
     # Parse field descriptors
     fields: list[DBFField] = []
+    issues: list[str] = []
     field_occurrences: dict[str, int] = {}
     off = 32
     n = len(data)
 
-    while off + 32 <= n:
-        chunk = data[off : off + 32]
-        if chunk[0] in (0x00, _HEADER_TERMINATOR):
+    limit = header_len if 32 < header_len <= n else n
+    while off < limit:
+        if data[off] in (0x00, _HEADER_TERMINATOR):
             break
+        if off + 32 > limit:
+            issues.append(f"truncated field descriptor at byte {off}")
+            break
+        chunk = data[off : off + 32]
         ftype = chr(chunk[11])
         if ftype not in _FIELD_TYPES:
-            break
+            issues.append(f"unsupported field type {ftype!r} at byte {off}; retained as text")
         name = chunk[:11].split(b"\x00", 1)[0].decode("ascii", "replace")
         occurrence = field_occurrences.get(name, 0) + 1
         field_occurrences[name] = occurrence
@@ -219,17 +244,46 @@ def parse_dbf(data: bytes) -> DBFTable:
         )
         off += 32
 
+    if off >= n or data[off] != _HEADER_TERMINATOR:
+        issues.append(f"missing dBase header terminator at byte {off}")
+
+    # Reserve literal vendor names so generated duplicate suffixes cannot hide them.
+    reserved = {f.name for f in fields} | {"__deleted__"}
+    allocated = {"__deleted__"}
+    resolved_fields = []
+    for descriptor in fields:
+        key = descriptor.key
+        suffix = descriptor.occurrence
+        while key in allocated or (key != descriptor.name and key in reserved):
+            suffix += 1
+            key = f"{descriptor.name}_{suffix}"
+        allocated.add(key)
+        resolved_fields.append(DBFField(
+            descriptor.name, descriptor.type, descriptor.width, descriptor.decimals,
+            descriptor.occurrence, key if key != descriptor.key else None,
+        ))
+    fields = resolved_fields
+
     sum_widths = sum(f.width for f in fields)
 
     # Determine record offset
-    if header_len and 0 < header_len <= n:
+    if off < header_len <= n:
         rec_off = header_len
     else:
+        issues.append(f"invalid record-data offset {header_len}")
         if off < n and data[off] == _HEADER_TERMINATOR:
             off += 1
         rec_off = off
 
-    rec_size = rec_size_hdr if rec_size_hdr >= sum_widths else 1 + sum_widths
+    minimum_size = 1 + sum_widths
+    if rec_size_hdr < minimum_size:
+        issues.append(f"record size {rec_size_hdr} is smaller than required {minimum_size}")
+    rec_size = max(rec_size_hdr, minimum_size)
+    count = min(nrecs, max(0, (n - rec_off) // rec_size))
+    if count != nrecs:
+        issues.append(f"truncated records: declared {nrecs}, complete {count}")
+    if strict and issues:
+        raise ValueError("; ".join(issues))
 
     # Resolve duplicate-name keys and field boundaries once per table.
     layout = []
@@ -238,14 +292,14 @@ def parse_dbf(data: bytes) -> DBFTable:
         layout.append((f.key, pos, pos + f.width, f.type, f.decimals))
         pos += f.width
 
-    if _native_parse_records is not None and isinstance(data, bytes) and rec_size > 0:
-        count = min(nrecs, (n - rec_off) // rec_size)
-        records = _native_parse_records(data, rec_off, rec_size, count, layout)
-        return DBFTable(nrecs=nrecs, fields=fields, records=records)
+    if (_native_parse_records is not None and isinstance(data, bytes)
+            and all(f.type in _FIELD_TYPES for f in fields)):
+        native_records = _native_parse_records(data, rec_off, rec_size, count, layout)
+        return DBFTable(nrecs, fields, native_records, tuple(issues))
 
     # Parse records
     records: list[dict[str, Any]] = []
-    for i in range(nrecs):
+    for i in range(count):
         start = rec_off + i * rec_size
         end = start + rec_size
         if end > n:
@@ -263,4 +317,4 @@ def parse_dbf(data: bytes) -> DBFTable:
             out[key] = _decode_text_value(rec[field_start:field_end], ftype, decimals)
         records.append(out)
 
-    return DBFTable(nrecs=nrecs, fields=fields, records=records)
+    return DBFTable(nrecs, fields, records, tuple(issues))

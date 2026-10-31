@@ -177,7 +177,7 @@ def test_real_peak_quantitation_export_and_reopen(tmp_path) -> None:
     import csv
     import json
 
-    fixture = Path(__file__).parents[2] / "data" / "UMP 20260508 PS.qld"
+    fixture = Path(__file__).parents[1] / "data" / "UMP 20260508 PS.qld"
     if not fixture.exists():
         pytest.skip("repository fixture unavailable")
     original = read(fixture)

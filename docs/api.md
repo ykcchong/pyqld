@@ -9,16 +9,22 @@ including JSON schemas, revision handling, and curl examples.
 
 ## Primary API
 
-### `read(path) -> Dataset`
+### `read(path, *, strict=False) -> Dataset`
 
 Read, decode, parse, and index one TargetLynx `.qld` file. This is the preferred
 entry point for applications.
+
+`strict=True` rejects malformed compression, DBF layouts, INI structure and
+wrong payload types in known streams. It does not certify metadata semantics
+or eliminate inferred ownership; call `validate()` separately. Containers
+without recognized QLD streams and duplicate canonical stream names always
+raise `ValueError`. Stream keys normalize to `QD1`, `QD2`, ..., and `qld`.
 
 ### `Dataset`
 
 | Attribute or method | Result |
 | --- | --- |
-| `Dataset.from_path(path)` | Equivalent constructor to `read(path)` |
+| `Dataset.from_path(path, *, strict=False)` | Equivalent constructor to `read(path, strict=strict)` |
 | `samples` | Ordered `tuple[Sample, ...]` from QD1 |
 | `results` | Ordered `tuple[QuantitationResult, ...]` from QD2 |
 | `peaks` | Compatibility alias for `results` |
@@ -41,6 +47,7 @@ entry point for applications.
 | `chromatograms_for(sample, *, function=None, transition=None)` | All matching stored traces in file order, including duplicates |
 | `chromatogram(sample, *, function, transition)` | Unique acquisition-checked trace, `None` if missing, `ValueError` if ambiguous |
 | `spectra_for(sample, *, function=None)` | Stored spectra for an injection |
+| `media_ownership("QD5" \| "QD7")` | `audited`, `single_sample`, `inferred`, `unresolved`, or `empty` evidence for signal ownership |
 | `validate()` | Immutable `ValidationReport`; does not modify data or raise on reported issues |
 | `compound_results(*, sample=None, compound=None)` | List of named result dictionaries, including injection index, file name and result index |
 | `export_results(path, *, format="csv", sample=None, compound=None)` | Export named results as CSV/JSON; existing destination raises `FileExistsError` |
@@ -274,13 +281,29 @@ original vendor names for diagnostics.
 
 Common convenience properties:
 
+DBF duplicate keys avoid collisions with literal vendor names and the internal
+deletion marker. `DBFField.key` gives the actual unique record key. Snake-case
+alias collisions retain the legacy last-column base alias while earlier
+columns receive unique suffixed aliases, so iteration/`to_dict()` no longer
+lose those values. `raw_fields` retains the DBF keys.
+
 | Class | Properties |
 | --- | --- |
 | `Sample` | `id`, `file_name`, `description`, `sample_type`, `vial`, `injection_volume` |
 | `Compound` | `name`, `cas_number`, `units`, `function`, `quantifier_transition`, `qualifier_transition`, `expected_retention_time` |
 | `QuantitationResult` | `sample_id`, `analyte_name`, `function`, `transition`, `area`, `height`, `retention_time`, `concentration`, `response`, `integration`, `quality` |
 | `Chromatogram` | `function`, `trace`, `times`, `intensities`, metadata properties, iteration over `(time, intensity)` |
-| `Spectrum` | `function`, `time`, `points`, `masses`, `intensities`, iteration over `(mass, intensity)` |
+| `Spectrum` | `function`, `time`, `retention_time`, `points`, `masses`, `intensities`, iteration over `(mass, intensity)` |
+
+`Spectrum.retention_time` is the strict RT accessor in minutes: missing/blank
+values return `None`; malformed, negative, or nonfinite values raise `ValueError`.
+Zero is valid. The legacy `time` accessor is unchanged.
+
+`media_ownership()` describes the existing layout without changing lookup
+behavior. Valid audited counts take precedence; a nonempty unaudited single
+injection is `single_sample`; equal-count multi-injection grouping is `inferred`.
+Malformed audited layouts are `unresolved`, even for one injection. A valid
+layout with no signals is `empty`.
 
 ### Domain values
 
@@ -363,7 +386,133 @@ all stored traces. See [matching details](usage.md#numeric-mrm-matching-and-acqu
 
 ## File and export API
 
-### `open_qld(path) -> QLDFile`
+### MS interoperability
+
+These functions are available from `pyqld`. Optional engines are imported only
+when used. Install `pyqld[openms]` for pyOpenMS 3.6+ (below 4), or
+`pyqld[matchms]` for matchms. Each extra has its own Python/platform requirements;
+the core package's Python minimum is unchanged.
+
+#### `to_openms(dataset, sample, *, allow_inferred_ownership=False, spectrum_metadata=None)`
+
+Returns `OpenMSConversion(experiment, report)`: an independent mutable
+`pyopenms.MSExperiment` and a JSON-ready provenance dictionary.
+
+* One injection per experiment; `sample` uses the normal dataset lookup rules.
+* Converts **all retained MRM chromatograms** for that injection. Non-MRM labels,
+  duplicate/ambiguous traces, conflicting acquisition channels, invalid/empty
+  arrays, and non-increasing/negative chromatogram times raise `ValueError`.
+* RT is converted from minutes to seconds. Intensities are not normalized;
+  OpenMS stores them as float32. Coordinates use float64. Overflow is rejected.
+  Configured Decimal masses are preserved in metadata; distinct transitions
+  that collapse to the same float64 pair within a function are rejected.
+* Native IDs are `pyqld_sample_<index>_qd5_<source_index>` (or `qd7` for spectra).
+  They are unique within the source dataset, not globally across files.
+* Precursor/product m/z and recognized polarity are mapped. Dwell time is in
+  seconds and cone voltage in volts. Reported collision energy is preserved as
+  metadata with **unverified units**, not silently asserted to be eV.
+* Inferred ownership requires explicit opt-in, recorded in the report.
+  Unresolved ownership cannot be overridden.
+* Spectra are excluded by default and the omission is reported. To include
+  them, `spectrum_metadata` must map **every QD7 index belonging to the selected
+  injection**, and no others, to `SpectrumMetadata`.
+
+The report includes the source path, a SHA-256 fingerprint of length-delimited,
+name-sorted decoded streams (or `None` for structures without retained streams),
+injection identity, units, ownership evidence, source indexes, processing text,
+acquisition report text/instrument/local timestamp (no inferred timezone),
+conversion warnings, and dataset validation diagnostics. The decoded-stream
+fingerprint is not a hash of the original container file. Dataset diagnostics
+may include unrelated result-selection problems; structural errors and errors
+in selected signals block conversion. A successful export does not certify
+complete acquisition coverage or native TargetLynx compatibility.
+
+#### `export_mzml(dataset, sample, path, *, allow_inferred_ownership=False, spectrum_metadata=None) -> Path`
+
+Writes mzML and a mandatory sibling `<path>.json` provenance report, including
+the mzML SHA-256. Uses the same conversion rules as `to_openms`. Both paths must
+be absent; existing files or symlinks raise `FileExistsError`. The parent must
+exist. Files are staged before publication and files published by the current
+call are removed if publication fails. Multi-file visibility is not atomic.
+
+#### `SpectrumMetadata`
+
+Frozen metadata supplied from independently verified acquisition information:
+
+| Field | Requirement |
+| --- | --- |
+| `ms_level` | Positive integer, not boolean |
+| `spectrum_type` | `centroid` or `profile` |
+| `polarity` | `positive` or `negative` |
+| `evidence` | Nonempty description/reference for the supplied interpretation |
+| `precursor_mz` | Positive finite m/z; required for MS level > 1 |
+| `precursor_charge` | Optional nonzero integer, consistent with polarity |
+| `collision_energy_ev` | Optional finite nonnegative energy in eV |
+| `isolation_lower_offset`, `isolation_upper_offset` | Optional finite nonnegative offsets in Th |
+
+MS1 metadata must not contain precursor information. Missing/invalid spectrum
+RT, unsorted/nonpositive masses, or conflicting known acquisition polarity
+blocks conversion. The library records caller evidence but cannot independently
+certify it. This API does not establish that QD7 represents raw fragmentation
+spectra, nor reconstruct absent spectra.
+
+#### `to_matchms(dataset, sample, metadata, *, allow_inferred_ownership=False)`
+
+Returns a list of independent `matchms.Spectrum` objects. `metadata` has the
+same complete QD7-index mapping as above. Requires verified **centroid MS2**
+spectra and nonnegative intensities. Preserves stored peaks without sorting,
+normalization, centroiding, or matchms metadata harmonization. RT metadata is
+in seconds; source identity, ownership, and evidence are retained.
+
+#### `quantitation_report(dataset, sample, *, allow_inferred_ownership=False)`
+#### `export_quantitation(dataset, sample, path, *, allow_inferred_ownership=False) -> Path`
+
+Return/write a JSON-ready report with all injection result rows, including
+unnamed, deleted, and non-primary rows. Preserve raw mapped result fields, QC,
+integration, concentration units, compound/method records, calibration values,
+and the **whole batch's** parsed audit data. No result selection or recalculation
+occurs; result RT stays in minutes and stored areas are not rescaled. Signal IDs
+match mzML IDs, with explicit `unique`, `missing`, or `ambiguous` link status.
+Unresolved result ownership raises. JSON writing rejects nonfinite values and
+refuses existing destinations. Neither function requires an optional MS engine.
+
+#### Targeted assays
+
+`AssayTransition` is frozen and contains explicit caller-supplied fields:
+`compound_index`, `role` (`quantifier`/`qualifier`), `precursor_charge`,
+`product_charge`, `library_intensity`, `retention_time_seconds`, and `evidence`.
+Charges are nonzero integers; intensity/RT must be finite and nonnegative;
+evidence must be nonempty. Roles must be declared by the compound and map to a
+unique stored trace. Duplicate assignments, inconsistent group metadata, and
+charges conflicting with known acquisition polarity raise.
+
+* `to_targeted_experiment(dataset, sample, assays, *, allow_inferred_ownership=False)`
+  returns an OpenMS `TargetedExperiment` using **small-molecule compounds**.
+* `export_traml(dataset, sample, assays, path, *, allow_inferred_ownership=False,
+  allow_nonconformant=False)` validates the staged TraML with OpenMS before
+  publishing that library and `<path>.json` provenance.
+* `export_skyline(dataset, sample, assays, path, *, allow_inferred_ownership=False)`
+  writes a Skyline small-molecule transition CSV and `<path>.json` provenance,
+  without requiring pyOpenMS. Explicit RT is converted to **minutes**.
+
+Only explicitly supplied assay transitions are exported; selections/omissions
+are recorded. Native IDs match chromatogram mzML. No charges, spectral-library
+intensities, or normalized/iRT values are inferred from QLD results. Retention
+times are local times, not iRT. These files do not reproduce TargetLynx's
+quantitation algorithm or audit/signature state.
+
+**TraML is strict by default.** With pyOpenMS 3.6, the native writer's
+small-molecule charge-state and library-intensity annotations can fail its own
+semantic validator, despite successful OpenMS read-back and targeted processing.
+Invalid output raises `ValueError` with the diagnostics and publishes neither
+file. `allow_nonconformant=True` explicitly permits that output, emits
+`UserWarning`, and records `semantic_validation` (`is_valid`, `errors`,
+`warnings`) and the override in the sidecar. No charges are dropped and no
+intensity units are invented to bypass the validator. This override is for
+deliberate consumer-specific interchange, not standards-conformance certification.
+Direct `to_targeted_experiment` and Skyline export are unaffected.
+
+### `open_qld(path, *, strict=False) -> QLDFile`
 
 Return the decoded streams and parsed low-level structures without building the
 object-model indexes.
@@ -372,7 +521,8 @@ object-model indexes.
 
 * `path`: resolved source path as a string.
 * `streams`: stream basename to decoded plaintext bytes.
-* `tables`: stream basename to `DBFTable` or `list[IniSection]`.
+* `tables`: stream basename to `DBFTable`, `list[IniSection]`, or `None` for an
+  unrecognized nonempty payload; its bytes remain in `streams`.
 * `stream_names()`: decoded names in OLE directory order.
 * `label_for(stream)`: stable human-readable export label.
 * `to_dict(include_raw=False)`: JSON-ready representation.
@@ -380,23 +530,37 @@ object-model indexes.
 ### JSON functions
 
 * `to_json(qld, indent=None, include_raw=False) -> str`
-* `export_json(qld_path, json_path, indent=None, include_raw=False) -> Path`
+* `export_json(qld_path, json_path, indent=None, include_raw=False, strict=False) -> Path`
 * `export_dir(qld_path, out_dir, indent=None, include_raw=False,
-  split_sections=False, split_threshold=50) -> Path`
+  split_sections=False, split_threshold=50, strict=False) -> Path`
+
+`strict` is forwarded to the reader. Uninterpreted streams always include their
+raw payload: `raw_b64` in JSON or a linked binary file in directory exports,
+even when `include_raw=False`. Empty INI streams remain ordinary empty sections.
 
 ## Parser API
 
-* `decode_quan_stream(data) -> bytes`: LZSS decompress, then XOR decrypt.
-* `lzss_decode(data) -> bytes`: decompress only.
+* `decode_quan_stream(data, *, strict=False) -> bytes`: LZSS decompress, then XOR decrypt.
+* `lzss_decode(data, *, strict=False) -> bytes`: decompress only.
 * `decrypt(data, key=0x65) -> bytes`: XOR transform only.
-* `parse_dbf(data) -> DBFTable`: parse a decoded QD1-QD4 table.
+* `parse_dbf(data, *, strict=False) -> DBFTable`: parse a decoded QD1-QD4 table.
 * `parse_ini(data) -> list[IniSection]`: parse decoded QD5-QD8/audit data.
   Pass `strict=True` to reject truncated blobs and malformed section structure.
+
+Strict codec checks run identically before native or Python decoding.
+`DBFTable.issues` records recovered layout problems and unsupported field types;
+strict parsing raises instead. Unknown DBF field types retain their fixed-width
+values as text without hiding later columns; their semantics are not decoded
+and editing those fields is refused. Headers shorter than 32 bytes always raise.
 
 `DBFTable.records` is a list of dictionaries. `IniSection.items` is an ordered
 list of key/value pairs so repeated keys are preserved. `IniSection.to_dict()`
 promotes repeated keys to lists. `IniBlob.payload_kind` is `text`, `float32`, or
 `bytes`.
+Only recognized array sections are interpreted as float32. Unknown non-text
+blobs remain bytes regardless of length. Misaligned known arrays remain bytes
+in tolerant mode and raise in strict mode. CR, LF, CRLF and mixed line endings
+are accepted; other explicit `eol` values raise.
 
 The parser-level functions are public for research and custom extraction, but
 normal applications should use `read()`.

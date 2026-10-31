@@ -77,7 +77,7 @@ def test_read_chromatograms_with_inconsistent_transition_spacing() -> None:
 
 def test_read_real_fixture() -> None:
     pytest.importorskip("olefile")
-    fixture = Path(__file__).parents[2] / "data" / "UMP 20260508 PS.qld"
+    fixture = Path(__file__).parents[1] / "data" / "UMP 20260508 PS.qld"
     if not fixture.is_file():
         pytest.skip("repository fixture is not available")
 

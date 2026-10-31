@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- End-to-end opt-in strict QLD reading with contextual compression/DBF/INI errors
+- DBF recovery diagnostics and conservative preservation of unsupported fields
+- Native helper type stubs and reader coverage/remaining-gap documentation
+
+- Optional pyOpenMS/mzML and qualified matchms adapters, with per-injection
+  identity, explicit unit conversion, strict ownership checks and provenance
+- Explicit small-molecule assay metadata and TraML/Skyline transition exports
+- Strict TraML semantic validation with an explicit, warned/provenance-recorded
+  override for nonconformant native OpenMS writer output
+- Linked quantitation reports preserving all result rows, QC, method/calibration
+  records and batch audit data, without rescaling stored results
+- Public media ownership evidence and strict optional spectrum retention time
+- MS/quantitation CLI formats with explicit sample and metadata selection
+
 - Read-only dataset validation with structured errors/warnings for source
   integrity, ownership, result selection, signals and acquisition metadata
 - Sample/function/transition chromatogram queries, cached read-only NumPy
@@ -30,6 +44,17 @@ All notable changes to this project will be documented in this file.
 - Snake-case mapping behavior for all DBF-backed records
 - Result filtering, tuple lookup, and iterable chromatogram/spectrum points
 - PEP 561 marker for downstream type checking
+
+### Fixed
+
+- INI no-progress on bare CR and section headers spanning later lines
+- Guessed float interpretation of unknown binary blobs and undetected array misalignment
+- DBF duplicate/suffixed-field collisions and hidden snake-case alias values
+- Unsupported DBF columns hiding subsequent fields and short-header unpacking failures
+- Case-sensitive QLD stream lookup, silent duplicate-stream replacement, and
+  unrelated OLE containers appearing to be empty datasets
+- Opaque future-stream payloads omitted from default JSON/directory exports
+- Incorrect fixture paths that skipped existing real-file regression tests
 
 ### Changed
 

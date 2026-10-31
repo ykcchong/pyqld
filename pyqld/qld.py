@@ -35,7 +35,13 @@ STREAM_LABELS: dict[str, str] = {
     "qld": "audit",
 }
 
-_QD_STREAM_RE = re.compile(r"(?i)QuanData[\\/].*DataStream\.(QD\d+|qld)$")
+_QD_STREAM_RE = re.compile(
+    r"(?i)(?:^|[\\/])QuanData[\\/](?:.*[\\/])?DataStream\.(QD\d+|qld)$"
+)
+
+
+def _canonical_stream(name: str) -> str:
+    return "qld" if name.lower() == "qld" else name.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +101,10 @@ class QLDFile:
             for path in ole.listdir():
                 name = "/".join(path)
                 match = _QD_STREAM_RE.search(name)
-                if match and match.group(1) in self._modified:
-                    replacements[name] = encode_quan_stream(self.streams[match.group(1)])
+                if match:
+                    stream = _canonical_stream(match.group(1))
+                    if stream in self._modified:
+                        replacements[name] = encode_quan_stream(self.streams[stream])
         return replace_streams(self._source, replacements)
 
     def save(self, path: str | Path, *, overwrite: bool = False) -> Path:
@@ -152,7 +160,7 @@ class QLDFile:
                 ]
             else:
                 entry["kind"] = "raw"
-            if include_raw:
+            if include_raw or not isinstance(parsed, (DBFTable, list)):
                 import base64
 
                 entry["raw_b64"] = base64.b64encode(
@@ -178,23 +186,32 @@ def _iter_ole_streams(ole_path: Path | bytes) -> Iterable[tuple[str, bytes]]:
 
     source = io.BytesIO(ole_path) if isinstance(ole_path, bytes) else str(ole_path)
     with olefile.OleFileIO(source) as ole:
+        seen: dict[str, str] = {}
         for entry in ole.listdir(streams=True, storages=False):
             joined = "/".join(entry)
             m = _QD_STREAM_RE.search(joined)
             if not m:
                 continue
-            basename = m.group(1)
+            basename = _canonical_stream(m.group(1))
+            if basename in seen:
+                raise ValueError(
+                    f"duplicate QLD stream {basename}: {seen[basename]!r} and {joined!r}"
+                )
+            seen[basename] = joined
             with ole.openstream(entry) as fh:
                 yield basename, fh.read()
 
 
-def open_qld(path: str | Path) -> QLDFile:
+def open_qld(path: str | Path, *, strict: bool = False) -> QLDFile:
     """Open a ``.qld`` file, decode every sub-stream, and parse it.
 
     Parameters
     ----------
     path : str | Path
         Path to the ``.qld`` file.
+    strict : bool
+        Reject malformed compression, table layouts, and INI structure, and
+        wrong known-stream payload types. Does not certify scientific metadata.
 
     Returns
     -------
@@ -206,18 +223,37 @@ def open_qld(path: str | Path) -> QLDFile:
     * If the decoded payload starts with the dBase magic ``0x037E`` the
       stream is parsed by :func:`pyqld.dbf.parse_dbf`.
     * Otherwise it is parsed by :func:`pyqld.ini.parse_ini`.
+    * Unrecognized nonempty payloads remain in ``streams`` with ``None`` in
+      ``tables`` and are exported as raw bytes. Strict mode rejects these for
+      known streams, but preserves future opaque streams.
+    * Stream keys are canonicalized; duplicate identities and containers without
+      QLD streams are rejected in both modes.
     """
     p = Path(path)
     source_bytes = p.read_bytes()
     qld = QLDFile(path=str(p.resolve()), _source=source_bytes)
 
     for name, raw in _iter_ole_streams(source_bytes):
-        plaintext = decode_quan_stream(raw)
-        qld.streams[name] = plaintext
-        if is_dbf(plaintext):
-            qld.tables[name] = parse_dbf(plaintext)
-        else:
-            qld.tables[name] = parse_ini(plaintext)
+        try:
+            plaintext = decode_quan_stream(raw, strict=strict)
+            qld.streams[name] = plaintext
+            if strict and name in {"QD1", "QD2", "QD3", "QD4"} and not is_dbf(plaintext):
+                raise ValueError("expected a dBase table")
+            if is_dbf(plaintext):
+                if strict and name in {"QD5", "QD6", "QD7", "QD8", "qld"}:
+                    raise ValueError("expected INI sections, found a dBase table")
+                qld.tables[name] = parse_dbf(plaintext, strict=strict)
+            else:
+                known = name in STREAM_LABELS
+                sections = parse_ini(plaintext, strict=strict and known)
+                qld.tables[name] = sections if sections or not plaintext else None
+                if strict and not known and sections:
+                    parse_ini(plaintext, strict=True)
+        except ValueError as error:
+            raise ValueError(f"{name}: {error}") from error
+
+    if not qld.streams:
+        raise ValueError("container has no recognized QuanData/DataStream QLD streams")
 
     return qld
 
@@ -248,9 +284,10 @@ def export_json(
     *,
     indent: int | None = None,
     include_raw: bool = False,
+    strict: bool = False,
 ) -> Path:
     """Read ``qld_path`` and write its JSON form to ``json_path``."""
-    qld = open_qld(qld_path)
+    qld = open_qld(qld_path, strict=strict)
     out = Path(json_path)
     out.write_text(
         to_json(qld, indent=indent, include_raw=include_raw), encoding="utf-8"
@@ -295,6 +332,7 @@ def export_dir(
     include_raw: bool = False,
     split_sections: bool = False,
     split_threshold: int = 50,
+    strict: bool = False,
 ) -> Path:
     """Write the ``.qld`` contents to a directory tree of JSON files.
 
@@ -312,7 +350,7 @@ def export_dir(
             audit.json
             raw/<stream>.bin        (only if include_raw=True)
     """
-    qld = open_qld(qld_path)
+    qld = open_qld(qld_path, **({"strict": True} if strict else {}))
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -400,9 +438,9 @@ def export_dir(
                     }
                 )
         else:
-            entry.update({"kind": "unknown"})
+            entry.update({"kind": "raw"})
 
-        if include_raw:
+        if include_raw or not isinstance(parsed, (DBFTable, list)):
             raw_dir = out / "raw"
             raw_dir.mkdir(exist_ok=True)
             raw_path = raw_dir / f"{stream}.bin"

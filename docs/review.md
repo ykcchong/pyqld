@@ -65,8 +65,12 @@ the observed file but is not filtered out by the reader.
   fixtures.
 * Spectrum association is by function and optional retention-time window, not
   by a vendor-provided sample foreign key.
-* The low-level codec tolerates truncated token buffers by returning decoded
-  output up to the truncation point. Strict corruption reporting would be a
-  separate compatibility change.
+* Default low-level decoding remains tolerant, but `read(..., strict=True)` now
+  rejects compressed-stream and parser corruption before returning a dataset.
+  Recovery diagnostics and unknown payloads remain available for investigation.
 * XML/TXT/MDB/CDB support remains in the legacy package and is intentionally not
   folded into the direct QLD reader.
+
+See [reader coverage and remaining gaps](development.md#reader-coverage-and-remaining-gaps)
+for the current corpus, repaired data-preservation gaps, and vendor semantics
+that still require evidence rather than inferred interpretations.

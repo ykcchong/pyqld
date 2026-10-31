@@ -16,8 +16,9 @@ See :doc:`../docs/format` for the full reverse-engineering write-up.
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
+_native_decode: Callable[[bytes, int], bytes] | None
 try:
     from ._codec_native import decode as _native_decode
 except ImportError:
@@ -25,6 +26,47 @@ except ImportError:
 
 #: The single-byte XOR key used by ``CQuanFileEncrypt`` (ASCII ``'e'``).
 XOR_KEY: int = 0x65
+
+
+def _compression_error(data: bytes) -> str | None:
+    """Validate token boundaries/history without expanding the compressed output."""
+    offset = output_size = 0
+    while offset < len(data):
+        if len(data) - offset < 4:
+            return f"truncated block header at byte {offset}"
+        flags_size = struct.unpack_from("<I", data, offset)[0]
+        if flags_size == 0:
+            return None if not any(data[offset:]) else f"invalid block at byte {offset}"
+        flags_start = offset + 4
+        tokens_header = flags_start + flags_size
+        if tokens_header + 4 > len(data):
+            return f"truncated flag buffer at byte {offset}"
+        tokens_size = struct.unpack_from("<I", data, tokens_header)[0]
+        tokens_start = tokens_header + 4
+        end = tokens_start + tokens_size
+        if end > len(data):
+            return f"truncated token buffer at byte {offset}"
+        position = tokens_start
+        for token in range(flags_size * 4):
+            if position == end:
+                break
+            code = (data[flags_start + token // 4] >> ((token % 4) * 2)) & 3
+            size = 1 if code == 0 else 3 if code == 2 else 2
+            if position + size > end:
+                return f"truncated token at byte {position}"
+            if code == 0:
+                output_size += 1
+            else:
+                distance = int.from_bytes(data[position:position + size - 1], "little")
+                length = data[position + size - 1]
+                if not 0 < distance <= output_size:
+                    return f"invalid back-reference at byte {position}"
+                output_size += length
+            position += size
+        if position != end:
+            return f"tokens without flags at byte {position}"
+        offset = end
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +168,11 @@ def _lzss_decode_python(data: bytes) -> bytes:
     return bytes(out)
 
 
-def lzss_decode(data: bytes) -> bytes:
+def lzss_decode(data: bytes, *, strict: bool = False) -> bytes:
     """Decompress the LZSS layer of an entire stream payload.
+
+    With ``strict=True``, reject invalid/truncated blocks and references before
+    either the Python or native decoder runs. Default recovery is unchanged.
 
     Parameters
     ----------
@@ -139,6 +184,8 @@ def lzss_decode(data: bytes) -> bytes:
     bytes
         The LZSS-decompressed (still XOR-encrypted) data.
     """
+    if strict and (error := _compression_error(data)) is not None:
+        raise ValueError(error)
     if _native_decode is not None and isinstance(data, bytes):
         return _native_decode(data, 0)
     return _lzss_decode_python(data)
@@ -162,10 +209,11 @@ def decrypt(buf: bytes, key: int = XOR_KEY) -> bytes:
     return bytes(b ^ key for b in buf)
 
 
-def decode_quan_stream(data: bytes) -> bytes:
+def decode_quan_stream(data: bytes, *, strict: bool = False) -> bytes:
     """Full decode of one ``QuanData/DataStream.QDx`` substream.
 
     Applies LZSS decompression followed by XOR decryption.
+    ``strict=True`` rejects malformed compression rather than returning a prefix.
 
     Parameters
     ----------
@@ -177,6 +225,8 @@ def decode_quan_stream(data: bytes) -> bytes:
     bytes
         The fully decoded plaintext (dBase or INI content).
     """
+    if strict and (error := _compression_error(data)) is not None:
+        raise ValueError(error)
     if _native_decode is not None and isinstance(data, bytes):
         return _native_decode(data, XOR_KEY)
     return decrypt(_lzss_decode_python(data))

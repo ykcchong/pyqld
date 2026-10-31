@@ -32,7 +32,7 @@ def test_table_patch_preserves_other_bytes() -> None:
 
 
 def test_container_preserves_all_streams_and_metadata() -> None:
-    fixture = Path(__file__).parents[2] / "data" / "UMP 20260508 PS.qld"
+    fixture = Path(__file__).parents[1] / "data" / "UMP 20260508 PS.qld"
     if not fixture.exists():
         pytest.skip("repository fixture unavailable")
     source = fixture.read_bytes()
@@ -50,7 +50,7 @@ def test_container_preserves_all_streams_and_metadata() -> None:
 
 
 def test_public_edit_save_reopen(tmp_path: Path) -> None:
-    fixture = Path(__file__).parents[2] / "data" / "UMP 20260508 PS.qld"
+    fixture = Path(__file__).parents[1] / "data" / "UMP 20260508 PS.qld"
     if not fixture.exists():
         pytest.skip("repository fixture unavailable")
     original = read(fixture)
@@ -68,4 +68,3 @@ def test_public_edit_save_reopen(tmp_path: Path) -> None:
         edited.with_changes(original.samples[0], file_text="invalid")
     with pytest.raises(ValueError, match="width"):
         original.with_changes(original.samples[0], file_text="x" * 10000)
-

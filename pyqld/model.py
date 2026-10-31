@@ -19,13 +19,14 @@ Linkage rules (reverse-engineered from Waters TargetLynx output)
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -68,7 +69,19 @@ def _snake_case(name: str) -> str:
 @lru_cache(maxsize=256)
 def _record_keys(names: tuple[str, ...]) -> Mapping[str, str]:
     """Share immutable aliases for identical ordered row schemas."""
-    return MappingProxyType({_snake_case(key): key for key in names})
+    reserved = {_snake_case(name) for name in names}
+    aliases: dict[str, str] = {}
+    for name in reversed(names):
+        base = _snake_case(name) or "field"
+        alias = base
+        suffix = 1
+        while (alias in aliases or (alias in names and alias != name)
+               or (alias != base and alias in reserved)):
+            suffix += 1
+            alias = f"{base}_{suffix}"
+        aliases[alias] = name
+    by_name = {name: alias for alias, name in aliases.items()}
+    return MappingProxyType({by_name[name]: name for name in names})
 
 
 class _Record(Mapping[str, Any]):
@@ -562,6 +575,29 @@ class Spectrum(_Signal):
         return _float(self._section, "Time")
 
     @property
+    def retention_time(self) -> float | None:
+        """Stored retention time in minutes, or ``None`` when absent or empty.
+
+        Unlike :attr:`time`, malformed, nonfinite, and negative values raise
+        :class:`ValueError` rather than being silently accepted or defaulted.
+        """
+        for key, value in self._section.items:
+            if key != "Time":
+                continue
+            if not isinstance(value, str):
+                raise ValueError("invalid spectrum retention time: expected a scalar Time")
+            if not value.strip():
+                return None
+            try:
+                time = float(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid spectrum retention time: {value!r}") from exc
+            if not math.isfinite(time) or time < 0:
+                raise ValueError(f"invalid spectrum retention time: {value!r}")
+            return time
+        return None
+
+    @property
     def points(self) -> int:
         return _int(self._section, "Points")
 
@@ -935,6 +971,37 @@ class Dataset:
         self._spectra_by_sample_function: list[dict[int, list[Spectrum]]] = []
         self._build_media_layouts()
 
+    def media_ownership(
+        self, stream: Literal["QD5", "QD7"],
+    ) -> Literal["audited", "single_sample", "inferred", "unresolved", "empty"]:
+        """Describe the evidence behind the existing sample-owned media layout.
+
+        Audited boundaries take precedence over a single-sample assignment.
+        Equal splits across multiple samples are only inferred. Invalid audited
+        boundaries remain unresolved, including for single-sample or empty data.
+        This classification does not change the existing lookup heuristics.
+        """
+        if stream == "QD5":
+            top_level, child = "Chromatograms", "SampleChromatograms"
+            total = len(self.chromatograms)
+        elif stream == "QD7":
+            top_level, child = "Spectra", "SampleSpectra"
+            total = len(self.spectra)
+        else:
+            raise ValueError(f"unsupported media stream: {stream!r}; expected QD5 or QD7")
+
+        audited = self._sample_table_sizes(
+            top_level, child, total, allow_even_split=False,
+        )
+        if audited is not None:
+            return "empty" if total == 0 else "audited"
+        layout = self._sample_table_sizes(
+            top_level, child, total, allow_even_split=True,
+        )
+        if layout is None:
+            return "unresolved"
+        return "single_sample" if len(self.samples) == 1 else "inferred"
+
     # ---------------------------------------------------- internal layout
 
     def _build_result_ownership(self) -> None:
@@ -1121,7 +1188,7 @@ class Dataset:
     # --------------------------------------------------------- factories
 
     @classmethod
-    def from_path(cls, path: str | Path) -> Dataset:
+    def from_path(cls, path: str | Path, *, strict: bool = False) -> Dataset:
         """Open a ``.qld`` file and return a :class:`Dataset`.
 
         Parameters
@@ -1133,7 +1200,7 @@ class Dataset:
         -------
         Dataset
         """
-        return cls(open_qld(path))
+        return cls(open_qld(path, strict=strict))
 
     # --------------------------------------------------------- lookups
 

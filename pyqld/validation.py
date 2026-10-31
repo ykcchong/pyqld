@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import math
-import struct
 from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
-from .dbf import DBFTable
+from .codec import _compression_error
+from .dbf import DBFTable, parse_dbf
 from .ini import parse_ini
 
 if TYPE_CHECKING:
@@ -51,47 +51,6 @@ class ValidationReport:
         return {"is_valid": self.is_valid, "issues": [asdict(issue) for issue in self.issues]}
 
 
-def _compression_error(data: bytes) -> str | None:
-    """Check token structure/history without expanding the compressed output."""
-    offset = output_size = 0
-    while offset < len(data):
-        if len(data) - offset < 4:
-            return f"truncated block header at byte {offset}"
-        flags_size = struct.unpack_from("<I", data, offset)[0]
-        if flags_size == 0:
-            return None if not any(data[offset:]) else f"invalid block at byte {offset}"
-        flags_start = offset + 4
-        tokens_header = flags_start + flags_size
-        if tokens_header + 4 > len(data):
-            return f"truncated flag buffer at byte {offset}"
-        tokens_size = struct.unpack_from("<I", data, tokens_header)[0]
-        tokens_start = tokens_header + 4
-        end = tokens_start + tokens_size
-        if end > len(data):
-            return f"truncated token buffer at byte {offset}"
-        position = tokens_start
-        for token in range(flags_size * 4):
-            if position == end:
-                break  # final flag byte may contain unused token slots
-            code = (data[flags_start + token // 4] >> ((token % 4) * 2)) & 3
-            size = 1 if code == 0 else 3 if code == 2 else 2
-            if position + size > end:
-                return f"truncated token at byte {position}"
-            if code == 0:
-                output_size += 1
-            else:
-                distance = int.from_bytes(data[position : position + size - 1], "little")
-                length = data[position + size - 1]
-                if not 0 < distance <= output_size:
-                    return f"invalid back-reference at byte {position}"
-                output_size += length
-            position += size
-        if position != end:
-            return f"tokens without flags at byte {position}"
-        offset = end
-    return None
-
-
 def validate_dataset(dataset: Dataset) -> ValidationReport:
     from .model import Chromatogram
     from .qld import _iter_ole_streams
@@ -114,7 +73,24 @@ def validate_dataset(dataset: Dataset) -> ValidationReport:
             add("source_container", str(error))
 
     for name, table in dataset.qld.tables.items():
+        if name in {"QD1", "QD2", "QD3", "QD4"} and not isinstance(table, DBFTable):
+            add("stream_type", "expected a dBase table", name)
+        elif name in {"QD5", "QD6", "QD7", "QD8", "qld"} and not isinstance(table, list):
+            add("stream_type", "expected INI sections", name)
+        elif table is None:
+            add(
+                "unknown_stream", "uninterpreted stream retained as raw bytes", name,
+                severity="warning",
+            )
         if isinstance(table, DBFTable):
+            if name in dataset.qld.streams:
+                try:
+                    parse_dbf(dataset.qld.streams[name], strict=True)
+                except ValueError as error:
+                    add("dbf_structure", str(error), name)
+            elif table.issues:
+                for issue in table.issues:
+                    add("dbf_structure", issue, name)
             if len(table.records) != table.nrecs:
                 add(
                     "table_row_count",
@@ -199,6 +175,15 @@ def validate_dataset(dataset: Dataset) -> ValidationReport:
                 severity="warning",
             )
         for item in items:
+            if not isinstance(item, Chromatogram):
+                try:
+                    if item.retention_time is None:
+                        add(
+                            "spectrum_time", "missing spectrum retention time",
+                            stream, item.index, "warning",
+                        )
+                except ValueError as error:
+                    add("spectrum_time", str(error), stream, item.index)
             x = item.times if isinstance(item, Chromatogram) else item.masses
             y = item.intensities
             if not x and not y:

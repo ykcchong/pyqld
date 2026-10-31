@@ -92,6 +92,14 @@ records (nrecs × record_size bytes):
     ASCII field values, padded to each field's width
 ```
 
+The observed headers can include zero padding after the `0x0D` descriptor
+terminator, before the declared record-data offset. Readers use that offset and
+require each record's stride to include its deletion flag. Duplicate column
+names occur; generated suffixes must not collide with literal vendor column
+names. Other field-type codes are not semantically decoded: tolerant reading
+preserves their fixed-width text with diagnostics, and strict reading rejects
+them.
+
 ### INI-Style Sections (QD5–QD8, qld)
 
 ```
@@ -107,3 +115,8 @@ Blobs contain either packed `float32` arrays (for `Times`, `Masses`, `Intensitie
 Unknown blob payloads are retained as bytes and represented as base64 by the
 JSON serializer. QD8 is observed as empty in current fixtures, but readers must
 not assume it is absent.
+
+Binary length being divisible by four is not evidence that an unknown payload
+is a float array. Only recognized array section names receive that interpretation.
+Misaligned known arrays are retained as bytes in recovery mode and rejected in
+strict mode. CR, LF and CRLF line endings, including mixtures, are accepted.

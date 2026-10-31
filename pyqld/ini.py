@@ -18,12 +18,14 @@ A *blob* contains either:
 * an ASCII text blob (e.g. the ``Experiment`` and ``Header`` sections in
   the QD6 audit stream).
 
-The parser auto-detects the payload type.
+Only recognized array sections are decoded as floats. Other binary payloads
+remain bytes; printable ASCII can be represented as text without information loss.
 """
 
 from __future__ import annotations
 
 import base64
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +37,7 @@ FLOAT_BLOB_SECTIONS: frozenset[str] = frozenset(
 
 #: Section names whose blob payload is always ASCII text.
 TEXT_BLOB_SECTIONS: frozenset[str] = frozenset({"Experiment", "Header"})
+_LINE_END = re.compile(br"\r\n|\r|\n")
 
 
 # ---------------------------------------------------------------------------
@@ -126,25 +129,21 @@ class _Cursor:
         return self.data[self.pos : self.pos + n]
 
     def read_eol(self) -> bool:
-        if self.data[self.pos : self.pos + self.eol_len] == self.eol:
-            self.pos += self.eol_len
-            return True
-        if self.data[self.pos : self.pos + 1] == b"\n":
-            self.pos += 1
+        match = _LINE_END.match(self.data, self.pos)
+        if match is not None:
+            self.pos = match.end()
             return True
         return False
 
     def read_line(self) -> bytes:
         """Read up to but not including the next EOL; consume the EOL."""
-        idx = self.data.find(b"\n", self.pos)
-        if idx < 0:
+        match = _LINE_END.search(self.data, self.pos)
+        if match is None:
             line = self.data[self.pos :]
             self.pos = len(self.data)
             return line
-        line = self.data[self.pos : idx]
-        if line.endswith(b"\r"):
-            line = line[:-1]
-        self.pos = idx + 1
+        line = self.data[self.pos : match.start()]
+        self.pos = match.end()
         return line
 
 
@@ -155,9 +154,11 @@ class _Cursor:
 
 def _payload_to_value(name: str, payload: bytes) -> tuple[Any, str]:
     """Convert a blob payload to ``(value, kind)`` based on section name."""
-    if name in FLOAT_BLOB_SECTIONS and len(payload) % 4 == 0:
-        floats = list(struct.unpack(f"<{len(payload) // 4}f", payload))
-        return floats, "float32"
+    if name in FLOAT_BLOB_SECTIONS:
+        if len(payload) % 4 == 0:
+            floats = list(struct.unpack(f"<{len(payload) // 4}f", payload))
+            return floats, "float32"
+        return payload, "bytes"
 
     if name in TEXT_BLOB_SECTIONS:
         try:
@@ -175,9 +176,6 @@ def _payload_to_value(name: str, payload: bytes) -> tuple[Any, str]:
             return text, "text"
     except UnicodeDecodeError:
         pass
-
-    if len(payload) % 4 == 0:
-        return list(struct.unpack(f"<{len(payload) // 4}f", payload)), "float32"
 
     return payload, "bytes"
 
@@ -201,6 +199,8 @@ def _parse_section_body(cur: _Cursor, section: IniSection) -> None:
             cur.pos += 8
             if cur.pos + size > len(cur.data):
                 cur.issues.append(f"truncated blob in {section.name!r} at byte {cur.pos}")
+            if section.name in FLOAT_BLOB_SECTIONS and size % 4:
+                cur.issues.append(f"misaligned float32 blob in {section.name!r}")
             payload = cur.data[cur.pos : cur.pos + size]
             cur.pos += size
             cur.read_eol()
@@ -261,7 +261,8 @@ def _parse_section(cur: _Cursor) -> IniSection | None:
     if cur.peek(1) != b"[":
         return None
     end_bracket = cur.data.find(b"]", cur.pos)
-    if end_bracket < 0:
+    line_end = _LINE_END.search(cur.data, cur.pos)
+    if end_bracket < 0 or (line_end is not None and end_bracket > line_end.start()):
         return None
     name = cur.data[cur.pos + 1 : end_bracket].decode("latin-1")
     cur.pos = end_bracket + 1
@@ -292,8 +293,9 @@ def parse_ini(
     eol : bytes, optional
         Line ending to use. Defaults to ``b"\\r\\n"`` if CRLF is found in
         the first kilobyte, otherwise ``b"\\n"``.
+        CR, LF and CRLF are accepted, including mixed line endings.
     strict : bool
-        Raise ValueError on truncated blobs, missing braces or invalid sections.
+        Raise ValueError on truncated/misaligned blobs, missing braces or invalid sections.
         The default preserves the tolerant parser behavior.
 
     Returns
@@ -304,6 +306,8 @@ def parse_ini(
     if eol is None:
         head = data[:1024]
         eol = b"\r\n" if b"\r\n" in head else b"\n"
+    elif eol not in (b"\r\n", b"\n", b"\r"):
+        raise ValueError("eol must be CRLF, LF, or CR")
 
     cur = _Cursor(data, eol)
     sections: list[IniSection] = []

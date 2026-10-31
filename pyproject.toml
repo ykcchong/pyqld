@@ -39,6 +39,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+openms = [
+    "pyopenms>=3.6,<4",
+]
+matchms = [
+    "matchms>=0.27,<1",
+]
+interop-test = [
+    "pyteomics>=4.7",
+    "lxml>=5",
+    "psims>=1.3",
+]
 dev = [
     "cloudpickle>=3.0",
     "pytest>=8.0",
@@ -64,7 +75,7 @@ pyqld = "pyqld.cli:main"
 include = ["pyqld*"]
 
 [tool.setuptools.package-data]
-pyqld = ["py.typed"]
+pyqld = ["py.typed", "*.pyi"]
 
 [tool.ruff]
 target-version = "py310"
@@ -82,5 +93,5 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 [[tool.mypy.overrides]]
-module = ["olefile"]
+module = ["olefile", "pyopenms", "matchms"]
 ignore_missing_imports = true

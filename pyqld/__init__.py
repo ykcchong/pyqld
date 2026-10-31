@@ -65,6 +65,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .assays import (
+    AssayTransition,
+    export_skyline,
+    export_traml,
+    to_targeted_experiment,
+)
 from .codec import XOR_KEY, decode_quan_stream, decrypt, lzss_decode
 from .dbf import DBFTable, parse_dbf
 from .domain import (
@@ -80,6 +86,15 @@ from .domain import (
     Quality,
 )
 from .ini import IniBlob, IniSection, parse_ini
+from .interop import (
+    OpenMSConversion,
+    SpectrumMetadata,
+    export_mzml,
+    export_quantitation,
+    quantitation_report,
+    to_matchms,
+    to_openms,
+)
 from .model import (
     Chromatogram,
     Compound,
@@ -103,9 +118,9 @@ from .quantitation import (
 from .validation import ValidationIssue, ValidationReport
 
 
-def read(path: str | Path) -> Dataset:
-    """Read a TargetLynx ``.qld`` file into a navigable dataset."""
-    return Dataset.from_path(path)
+def read(path: str | Path, *, strict: bool = False) -> Dataset:
+    """Read a QLD; opt into strict compression and structural parsing with ``strict``."""
+    return Dataset.from_path(path, strict=strict)
 
 
 __all__ = [
@@ -139,6 +154,18 @@ __all__ = [
     "integrate_peak",
     "ValidationIssue",
     "ValidationReport",
+    # Optional MS interoperability (engines are imported on demand)
+    "OpenMSConversion",
+    "SpectrumMetadata",
+    "AssayTransition",
+    "to_openms",
+    "export_mzml",
+    "to_matchms",
+    "quantitation_report",
+    "export_quantitation",
+    "to_targeted_experiment",
+    "export_traml",
+    "export_skyline",
     # High-level I/O
     "read",
     "QLDFile",

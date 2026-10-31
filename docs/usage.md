@@ -18,6 +18,157 @@ cd pyqld
 python -m pip install -e ".[dev]"
 ```
 
+## Interoperate with MS software
+
+The optional adapters export **retained QLD signals**, not a reconstructed raw
+acquisition. Start with chromatograms:
+
+```bash
+python -m pip install -e ".[openms]"
+```
+
+Use an interpreter/platform supported by pyOpenMS. The adapters are tested with
+pyOpenMS 3.6; installing an extra does not change the core package's Python
+minimum or make the optional engine available on unsupported interpreters.
+
+```python
+import pyqld
+
+dataset = pyqld.read("batch.qld")
+converted = pyqld.to_openms(dataset, 0)  # one injection, all retained MRM traces
+experiment = converted.experiment
+print(converted.report["warnings"])
+
+pyqld.export_mzml(dataset, 0, "injection-0.mzML")
+pyqld.export_quantitation(dataset, 0, "injection-0.results.json")
+```
+
+The mzML export also writes `injection-0.mzML.json` with source identities,
+ownership evidence, unit conversion, warnings, and an output checksum. Signal
+IDs link to the quantitation report. All destinations must be new and their
+parent directories must exist. Retain the original QLD for preservation.
+
+OpenMS RT is **seconds**; QLD RT and the quantitation report use **minutes**.
+Intensities are not normalized, and stored peak areas/concentrations are not
+rescaled. OpenMS intensity storage is float32. Conversion copies into independent
+objects; running an OpenMS filter does not change the QLD dataset.
+
+Exports reject ambiguous traces and unresolved ownership. Equal-sized
+sample-major grouping requires `allow_inferred_ownership=True`, which is
+recorded as an explicit assumption. Prefer audited ownership:
+
+```python
+print(dataset.media_ownership("QD5"))
+```
+
+### Assay libraries and Skyline
+
+Supply charges, library intensities, and local RT from a verified method/library,
+not guesses from polarity or observed result heights. For example, **only if**
+these values have been established for the selected compound:
+
+```python
+assays = [
+    pyqld.AssayTransition(
+        compound_index=0,
+        role="quantifier",
+        precursor_charge=-1,
+        product_charge=-1,
+        library_intensity=1.0,
+        retention_time_seconds=90.0,
+        evidence="Verified method/library revision and transition reference",
+    ),
+]
+library = pyqld.to_targeted_experiment(dataset, 0, assays)
+pyqld.export_skyline(dataset, 0, assays, "skyline-transitions.csv")
+```
+
+These illustrative values must be replaced with actual assay metadata.
+Skyline CSV export itself needs no optional engine. Import it as a small-molecule
+transition list, then import the corresponding mzML. CSV generation is tested;
+actual Skyline GUI acceptance is not yet certified. Successful interchange does
+not guarantee the same peak picking, calibration, or concentration as TargetLynx.
+
+TraML export is **strict by default**:
+
+```python
+pyqld.export_traml(dataset, 0, assays, "assays.TraML")
+```
+
+pyOpenMS 3.6's writer currently produces charge/intensity annotations that its
+semantic validator rejects for the tested small-molecule library. Strict export
+raises with those diagnostics and leaves no output files. OpenMS read-back and
+targeted peak processing work, but that is not standards-conformance validation.
+If you deliberately accept this limitation for an OpenMS workflow:
+
+```python
+pyqld.export_traml(
+    dataset, 0, assays, "assays.TraML", allow_nonconformant=True,
+)
+```
+
+The explicit override emits a warning and records all semantic-validation
+diagnostics in the sidecar. It does not change charges or invent library-intensity
+units. Prefer the direct in-memory library above when file interchange is not
+needed.
+
+### Qualified spectrum export
+
+Spectra are excluded by default because QD7 does not establish MS level,
+centroid/profile status, or precursor identity. If external evidence establishes
+those facts, supply `SpectrumMetadata` for every spectrum in the selected
+injection, keyed by its global `Spectrum.index`, using the `spectrum_metadata`
+argument to `to_openms` or `export_mzml`. Missing RT and inconsistent metadata are
+errors, not zero/default substitutions.
+
+`to_matchms(dataset, sample, metadata)` uses the same mapping and additionally
+requires centroid MS2 data. Install `pyqld[matchms]` separately. MRM chromatograms
+cannot be turned into fragmentation spectra by this adapter. Full MS1/DIA
+reprocessing still requires the appropriate original acquisition data.
+
+### Command line
+
+```bash
+pyqld batch.qld injection-0.mzML --format mzml --sample-index 0
+pyqld batch.qld injection-0.results.json --format quantitation --sample-index 0
+pyqld batch.qld transitions.csv --format skyline --sample-index 0 --assays assays.json
+pyqld batch.qld assays.TraML --format traml --sample-index 0 --assays assays.json
+```
+
+`--assays` accepts a JSON array with the `AssayTransition` fields above.
+`--spectrum-metadata` (mzML only) accepts a JSON object keyed by canonical
+zero-based QD7 indexes, with `SpectrumMetadata` objects as values. Duplicate JSON
+keys are rejected. `--allow-inferred-ownership` is an explicit opt-in.
+`--allow-nonconformant-traml` opts into the TraML policy described above and
+applies only to `--format traml`.
+MS export flags cannot be combined with JSON-directory/list options.
+Without `--format`, existing JSON CLI behavior is unchanged.
+
+### Current scale and verification
+
+The QLD reader remains eager. Convert/write one injection at a time and release
+the OpenMS object before processing the next. Each conversion currently validates
+the whole source dataset; repeated batch conversions therefore repeat that cost.
+No lazy-reader or streaming rewrite is included.
+
+On the development macOS ARM64 environment (Python 3.13, pyOpenMS 3.6), loading
+the two local fixtures took approximately 0.35/0.15 seconds. Converting their
+first injections (146/27 chromatograms) took approximately 2.8/1.1 seconds;
+building the corresponding quantitation reports took 2.8/1.1 seconds. These
+are observations, not performance guarantees. Peak process RSS reached about
+557 MiB with the engine and both datasets loaded over the measurement run;
+that is not a per-injection memory requirement.
+
+Tests cover OpenMS mzML semantic validation/read-back, an independent Pyteomics
+chromatogram read, real QLD fixtures, strict TraML rejection and explicit-override
+read-back, recovery of a synthetic
+targeted peak at its known RT, and matchms conversion. Broader acquisition types,
+Skyline GUI import, vendor-equivalent quantitation, and large-batch performance
+remain separate validation work.
+
+See the [interoperability API](api.md#ms-interoperability) for validation rules,
+metadata fields, publication behavior, and preservation limits.
+
 ## Read a file
 
 `read()` is the normal entry point. It decodes the complete file eagerly and
@@ -37,6 +188,38 @@ print(dataset.spectra)
 
 Input may be a string or `pathlib.Path`. The file remains closed after reading;
 no context manager is required.
+
+### Strict reading and recovery
+
+```python
+dataset = pyqld.read("batch.qld", strict=True)
+report = dataset.validate()
+report.raise_for_errors()
+```
+
+`strict=True` checks compressed block/token boundaries and history, DBF table
+layouts, INI nesting/blob lengths, and the payload types of known streams.
+Errors include stream context. The same option is available on `open_qld`,
+`Dataset.from_path`, JSON/directory exporters, and the CLI:
+
+```bash
+pyqld batch.qld --strict --list
+pyqld batch.qld decoded.json --strict
+```
+
+Default reads remain tolerant for inspection/recovery, but table recovery
+issues are now exposed in `DBFTable.issues` and dataset validation. An
+unsupported DBF field type no longer discards later fields; its stored text is
+retained with a diagnostic. Both modes reject duplicate canonical QLD stream
+identities and OLE containers without QLD streams.
+
+Unknown non-text blobs remain bytes rather than being guessed to be float32.
+Uninterpreted streams remain in `QLDFile.streams` and are included as raw
+base64/binary data in exports even without `include_raw=True`. QD8 remains
+uninterpreted when no evidence establishes its meaning.
+
+Strict reading does not replace scientific validation or infer missing spectrum
+metadata. See [remaining reader gaps](development.md#reader-coverage-and-remaining-gaps).
 
 ## Look up results
 

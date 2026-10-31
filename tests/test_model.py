@@ -283,7 +283,8 @@ def test_record_aliases_are_shared_immutable_and_schema_sensitive() -> None:
     assert second["a_b"] == 4
     assert reversed_keys["a_b"] == 6
     assert deleted["deleted"] is True
-    assert list(first) == ["a_b"]
+    assert first["a_b_2"] == 1
+    assert list(first) == ["a_b_2", "a_b"]
     with pytest.raises(TypeError):
         first._keys["new"] = "A-B"
 
